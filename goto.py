@@ -3,7 +3,7 @@
     python goto.py --check                  # say what would happen, move nothing
     python goto.py                          # the move, in meshcat
     python goto.py --real                   # the move, on the real arm
-    python goto.py --real --guided          # free drive, record, return home
+    python goto.py --real --guided          # record, return home, repeat until ctrl-c
 
 Simulation is the default; hardware needs `--real`.
 
@@ -29,11 +29,14 @@ to see it refused.
        arm be pushed by hand; joints 2, 3, 5 and 6 are watched and put back if
        they drift (see `xarm7_lib/free_drive.py`). A live plot, drawn with the
        student's `forward_kinematics_RR` from `fk.py`, shows the RR arm.
-       Press enter (terminal) or space (plot window) to start recording.
-    2. free drive, recording. The same session carries on, and every visited
-       point is drawn. Press enter or space again (or ctrl-c, or close the
-       plot) to stop.
-    3. the recording is saved to recordings/, and the arm drives back home.
+       Press enter to start recording.
+    2. free drive, recording. The same session carries on, the plot is
+       cleared, and every visited point is drawn. Press enter again to stop.
+    3. the recording is saved to recordings/, and the arm drives back home —
+       then straight back to 1 for the next recording.
+
+It only finishes on ctrl-c: during free drive that saves what was recorded
+and drives home first; anywhere else it stops the arm where it is.
 
 The recording is the RR joint angles, resampled onto an even grid at the
 free-drive rate (100 Hz) so that sample k is at k / rate, plus the elbow and
@@ -74,7 +77,8 @@ _SETTLE_GRACE = 15.0  # s added to a move's travel time before the wait gives up
 # vertical enough to free-drive. 3 degrees tilts a 426 mm forearm by 22 mm.
 _PLANAR_TOLERANCE = math.radians(3.0)
 
-DEFAULT_DURATION = 300.0  # s, a cap on the whole free-drive session
+DEFAULT_DURATION = 300.0  # s, a cap on each free drive
+RECORDINGS = Path(__file__).resolve().parent / "recordings"
 _REDRAW_PERIOD = 0.05  # s between plot redraws; the loop samples at 100 Hz
 
 # ----------------------------------------------------------------------
@@ -165,17 +169,17 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--guided", action="store_true",
-        help="after arriving, free-drive the arm by hand and record an RR "
-        "trajectory, then return home (real arm only)",
+        help="after arriving, free-drive the arm by hand and record RR "
+        "trajectories, returning home after each, until ctrl-c (real arm only)",
     )
     parser.add_argument(
         "--duration", type=float, default=DEFAULT_DURATION,
-        help="cap on the whole free-drive session, s (default: %(default)s)",
+        help="cap on each free drive, s (default: %(default)s)",
     )
     parser.add_argument(
         "--out",
-        help="where to write the recording "
-        "(default: recordings/rr-<timestamp>.npz)",
+        help="folder to write the recordings to, each as rr-<timestamp>.npz "
+        "(default: recordings/)",
     )
     parser.add_argument(
         "--check", action="store_true",
@@ -229,9 +233,13 @@ def controller_ip(given, prefix="goto"):
     raise SystemExit("no controller address: pass --ip or put one in ip.txt.")
 
 
-def default_recording_path():
+def default_recording_path(folder):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(__file__).resolve().parent / "recordings" / f"rr-{stamp}.npz"
+    path, n = Path(folder) / f"rr-{stamp}.npz", 1
+    while path.exists():  # two recordings inside the same second
+        n += 1
+        path = Path(folder) / f"rr-{stamp}-{n}.npz"
+    return path
 
 
 def degrees(q):
@@ -290,13 +298,23 @@ def confirm(question):
         return False
 
 
+def flush_stdin():
+    """Throw away anything typed ahead, so only a fresh enter counts."""
+    if sys.stdin.isatty():
+        import termios
+
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+
 def wait_for_enter(message):
     """Hold until someone presses enter. False if nobody is at the terminal.
 
     The guided phases gate on this even under `-y`: it is a beat to get hands
     clear, not a question. Nobody at the terminal means nobody watching the
-    arm, so the caller skips instead.
+    arm, so the caller skips instead. An enter pressed before the prompt
+    appeared doesn't count — it was meant for something else.
     """
+    flush_stdin()
     try:
         input(message)
         return True
@@ -402,22 +420,24 @@ class LivePlot:
 
         self.visited = []
         self.recording = False
-        self.pressed = False  # space in the figure, not yet consumed
         self.closed = False
         self._background = None
         self._drawn_at = -np.inf
         canvas = self.fig.canvas
-        canvas.mpl_connect("key_press_event", self._on_key)
         canvas.mpl_connect("close_event", self._on_close)
         canvas.mpl_connect("draw_event", self._on_draw)
-        ax.set_title("positioning — enter or space to start recording")
         ax.title.set_animated(True)  # so the phase switch is only a blit
+        self.reset()
         plt.show(block=False)
         plt.pause(0.1)
 
-    def _on_key(self, event):
-        if event.key in (" ", "enter"):
-            self.pressed = True
+    def reset(self):
+        """Back to positioning, with nothing recorded on the plot."""
+        self.visited = []
+        self.recording = False
+        self.path.set_data([], [])
+        self.ax.set_title("positioning — press enter to start recording")
+        self._drawn_at = -np.inf
 
     def _on_close(self, _event):
         self.closed = True
@@ -441,8 +461,10 @@ class LivePlot:
         if recording:
             self.visited.append(points[2])
         if recording and not self.recording:
+            # A fresh plot for each recording: only this one's points.
             self.recording = True
-            self.ax.set_title("recording — enter or space to stop")
+            self.visited = [points[2]]
+            self.ax.set_title("recording — press enter to stop")
         now = time.perf_counter()
         if self.closed or now - self._drawn_at < _REDRAW_PERIOD:
             return
@@ -455,18 +477,16 @@ class LivePlot:
             self._blit()
         self.fig.canvas.flush_events()
 
-    def hold(self):
-        """Show the finished plot until the window is closed."""
+    def finish(self, title):
+        """Draw the whole recording and say what became of it."""
         if self.closed:
             return
         if self.visited:
             self.path.set_data(*np.transpose(self.visited)[::-1])
-        for artist in (self.ax.title, self.path, self.links):
-            artist.set_animated(False)
-        self.ax.set_title(f"recorded — {len(self.visited)} samples")
-        print("[goto] close the plot window to exit.")
-        self.plt.ioff()
-        self.plt.show()
+        self.ax.set_title(title)
+        if self._background is not None:
+            self._blit()
+        self.fig.canvas.flush_events()
 
 
 def enter_pressed():
@@ -503,10 +523,72 @@ def rr_recording(traj, t_start, home):
     )
 
 
-def guided_session(arm, home, out, duration):
-    """Free drive with the live plot, saving what was recorded. Returns the plot."""
+def guided_session(arm, home, folder, duration, plot):
+    """One free drive: position, record, save. True if ctrl-c ended it."""
     from xarm7_lib.free_drive import FREE_JOINTS
 
+    plot.reset()
+    flush_stdin()  # an extra enter from before must not start the recording
+    print("[goto] free drive: move the arm to where the trajectory should "
+          "start,\n       then press enter to record and enter again to stop.")
+    state = {"t_start": None}
+
+    def on_sample(t, q):
+        pressed = enter_pressed()
+        if pressed and state["t_start"] is None:
+            state["t_start"] = t
+            print("[goto] recording — press enter to stop")
+            pressed = False
+        plot.update(q, recording=state["t_start"] is not None)
+        return pressed
+
+    traj = arm.free_drive(FREE_JOINTS, duration, on_sample=on_sample)
+    interrupted = traj.reason == "interrupted"
+    print(f"[goto] {traj}")
+    if arm.has_error:
+        print("[goto] the controller latched an error during free drive; "
+              "clearing it.")
+        arm.clear_errors()
+
+    if state["t_start"] is None or not np.any(traj.t >= state["t_start"]):
+        print("[goto] recording never started; nothing saved.")
+        plot.finish("not recorded")
+        return interrupted
+
+    recording = rr_recording(traj, state["t_start"], home)
+    out = default_recording_path(folder)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, **recording)
+    t = recording["t"]
+    print(f"[goto] {t.size} samples over {t[-1]:.1f}s written to {out}")
+    print(f"[goto] sampled at {traj.rate:.0f} Hz; the controller's report was "
+          f"seen changing at {traj.report_rate:.0f} Hz")
+    if traj.interruptions:
+        print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
+    plot.finish(f"saved {out.name} — {t.size} samples")
+    return interrupted
+
+
+def return_home(arm, home, speed, box, controller_errors, ask):
+    """Drive back to `home`. None once there, or the exit code if not."""
+    print(f"[goto] returning to {degrees(home)} deg")
+    if not preflight(arm.joint_values, home, box):
+        print("[goto] the way back isn't clear from where the arm was "
+              "left.\n       Leaving it as it is — move it clear and "
+              "re-run.")
+        return 2
+    if ask and not wait_for_enter(
+        f"[goto] hands clear — press enter to drive back at {speed} rad/s. "
+    ):
+        return 1
+    reached, code = move_to(arm, home, speed, controller_errors)
+    if code is not None:
+        return code
+    return None if reached else 1
+
+
+def guided_loop(arm, home, args, box, controller_errors):
+    """Record, return home, and go again, until ctrl-c. Returns the exit code."""
     offenders = out_of_plane(arm.joint_values)
     if offenders:
         names = ", ".join(f"joint{i + 1}" for i in offenders)
@@ -516,52 +598,33 @@ def guided_session(arm, home, out, duration):
             "and 7 are not vertical here.\n"
             "       Run without --joints to get the planar pose first."
         )
-        return None
+        return 1
 
     print("[goto] free drive: joints 1, 4 and 7 can be pushed by hand; 2, 3, 5 "
           "and 6 are\n       watched, and the arm stops to put them back if "
-          "they drift.")
-    print("[goto] phase 1: move the arm to where the trajectory should start.\n"
-          "       phase 2: press enter (here) or space (in the plot) to start "
-          "recording,\n                and again to stop. ctrl-c also stops.")
-    plot = LivePlot()
-    if not wait_for_enter("[goto] hands clear, then press enter to start free "
-                          "drive. "):
-        return plot
-
-    state = {"t_start": None}
-
-    def on_sample(t, q):
-        pressed = enter_pressed() or plot.pressed
-        plot.pressed = False
-        if pressed and state["t_start"] is None:
-            state["t_start"] = t
-            print(f"[goto] recording from {t:.1f}s — enter or space to stop")
-            pressed = False
-        plot.update(q, recording=state["t_start"] is not None)
-        return pressed or plot.closed
-
-    traj = arm.free_drive(FREE_JOINTS, duration, on_sample=on_sample)
-    print(f"[goto] {traj}")
-    if arm.has_error:
-        print("[goto] the controller latched an error during free drive; "
-              "clearing it.")
-        arm.clear_errors()
-
-    if state["t_start"] is None or not np.any(traj.t >= state["t_start"]):
-        print("[goto] recording never started; nothing saved.")
-        return plot
-
-    recording = rr_recording(traj, state["t_start"], home)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **recording)
-    t = recording["t"]
-    print(f"[goto] {t.size} samples over {t[-1]:.1f}s written to {out}")
-    print(f"[goto] sampled at {traj.rate:.0f} Hz; the controller's report was "
-          f"seen changing at {traj.report_rate:.0f} Hz")
-    if traj.interruptions:
-        print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
-    return plot
+          "they drift.\n       After each recording the arm drives home and "
+          "free drive starts again.\n       Ctrl-c to finish.")
+    folder = Path(args.out) if args.out else RECORDINGS
+    speed = min(args.speed, RETURN_SPEED_CAP)
+    plot = None
+    try:
+        if not wait_for_enter("[goto] hands clear, then press enter to start "
+                              "free drive. "):
+            return 1
+        while True:
+            if plot is None or plot.closed:
+                plot = LivePlot()
+            interrupted = guided_session(arm, home, folder, args.duration, plot)
+            code = return_home(arm, home, speed, box, controller_errors,
+                               ask=not args.yes)
+            if code is not None:
+                return code
+            if interrupted:
+                return 0
+    except KeyboardInterrupt:
+        arm.stop()
+        print("\n[goto] ctrl-c: done. The arm is stopped and holding.")
+        return 0
 
 
 # ----------------------------------------------------------------------
@@ -621,32 +684,8 @@ def main(argv=None):
             print("[goto] not starting free drive: the arm never reached the pose.")
             return 1
 
-        # ---- free drive: position, then record ------------------------
-        out = Path(args.out) if args.out else default_recording_path()
-        plot = guided_session(arm, goal, out, args.duration)
-
-        # ---- back home ------------------------------------------------
-        # Only joints 1, 4 and 7 have far to travel; the watched four were
-        # put back on their locks whenever they drifted.
-        print(f"[goto] returning to {degrees(goal)} deg")
-        if not preflight(arm.joint_values, goal, box):
-            print("[goto] the way back isn't clear from where the arm was "
-                  "left.\n       Leaving it as it is — move it clear and "
-                  "re-run.")
-            return 2
-
-        speed = min(args.speed, RETURN_SPEED_CAP)
-        if not args.yes and not wait_for_enter(
-            f"[goto] hands clear — press enter to drive back at {speed} rad/s. "
-        ):
-            return 1
-
-        reached, code = move_to(arm, goal, speed, controller_errors)
-        if plot is not None:
-            plot.hold()
-        if code is not None:
-            return code
-        return 0 if reached else 1
+        # ---- free drive: record, return home, repeat until ctrl-c -------
+        return guided_loop(arm, goal, args, box, controller_errors)
 
 
 if __name__ == "__main__":
