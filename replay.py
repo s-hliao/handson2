@@ -2,12 +2,9 @@
 
     python replay.py
 
-The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. On the
-real arm the wrist (joints 5-7) is left however it was found, bent for a pen
-say, and if a gripper is on the tool connector the claw is closed until it
-can't close any further, then held there. Each trajectory is drawn with the
-student's FK: the planned (recorded) path dotted, and the path the arm actually
-takes as it replays solid.
+The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. Each
+trajectory is drawn with the student's FK: the planned (recorded) path dotted,
+and the path the arm actually takes as it replays solid.
 """
 
 import time
@@ -29,39 +26,6 @@ START_SPEED = 0.3  # rad/s, for set_position's planned move
 # position reports show up as steps); a bigger jump is a bug in the student's
 # code — degrees, theta1/theta2 swapped, or samples skipped.
 MAX_STEP = 0.15
-CLAW_SPEED = 1500  # r/min, a slow squeeze (the gripper takes 1000-5000)
-CLAW_PRELOAD = 10  # pulses past where it stopped, so it keeps a grip (850 = open)
-
-
-def lock_claw(sdk):
-    """Close the xArm Gripper until it stops on whatever it holds, then hold it there.
-
-    The SDK's own wait is for reaching the target, which a claw closed on a pen
-    never does, so this watches the position until it stops changing instead.
-    """
-    code, pos = sdk.get_gripper_position()
-    if code != 0 or pos is None:
-        print("no gripper answering on the tool connector; leaving the claw alone")
-        return
-    sdk.clean_gripper_error()
-    sdk.set_gripper_mode(0)  # position mode
-    sdk.set_gripper_enable(True)
-    sdk.set_gripper_speed(CLAW_SPEED)
-    sdk.set_gripper_position(0, wait=False)
-    started = still_since = time.monotonic()
-    last = pos
-    while time.monotonic() - started < 10.0:
-        time.sleep(0.1)
-        code, pos = sdk.get_gripper_position()
-        if code != 0:
-            break
-        if abs(pos - last) > 1:
-            last, still_since = pos, time.monotonic()
-        elif time.monotonic() - started > 1.0 and time.monotonic() - still_since > 0.5:
-            break  # stalled on the pen, or fully closed
-    # Held a little tighter than where it stopped, so what it holds can't slip.
-    sdk.set_gripper_position(max(last - CLAW_PRELOAD, 0), wait=False)
-    print(f"claw closed to {last:.0f} (0 = shut, 850 = open) and held there")
 
 
 class RRArm:
@@ -85,15 +49,6 @@ class RRArm:
         ax.grid(alpha=0.3)
         ax.legend(loc="upper right", fontsize="small")
         self.robot = Robot()
-        # Only the real arm has a claw and a wrist worth keeping; the simulation's
-        # wrist is wherever its model starts, so there it follows the recording.
-        sdk = getattr(self.robot.robot, "arm", None)
-        self.wrist = None
-        if sdk is not None:
-            self.wrist = self.robot.joint_values[4:7].copy()
-            print(f"keeping the wrist as found: joints 5-7 at "
-                  f"{np.round(np.degrees(self.wrist), 1)} deg")
-            lock_claw(sdk)
 
     def new_trajectory(self, path, name):
         """Take the locked pose and rate from the recording, and clear the plot."""
@@ -144,11 +99,8 @@ class RRArm:
         self._redraw(f"{self.name} — done")
 
     def _pose(self, theta1, theta2):
-        """The 7-joint command for one RR sample: joints 2 and 3 at the recording's
-        home, the wrist as found (or at home in simulation)."""
+        """The 7-joint command for one RR sample; the locked joints stay at home."""
         q = self.home.copy()
-        if self.wrist is not None:
-            q[4:7] = self.wrist
         q[0], q[3] = theta1 - A1, A2 - theta2
         return q
 
