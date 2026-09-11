@@ -1,12 +1,12 @@
-"""Replay a recorded RR trajectory on the arm, plotted with the student's FK.
+"""Replay the recordings listed in fk.TRAJECTORIES, in order, with the student's run_trajectory.
 
-    python replay.py                          # the newest recordings/rr-*.npz
-    python replay.py recordings/rr-<stamp>.npz
+    python replay.py
 
-The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise.
+The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. Each
+trajectory is drawn with the student's FK: the recorded path, and the path the
+arm actually took as it replays.
 """
 
-import sys
 import time
 from pathlib import Path
 
@@ -14,76 +14,119 @@ import matplotlib.pyplot as plt
 import numpy as np
 from xarm7_lib import DEFAULT_BOX, Robot
 
-from fk import forward_kinematics_RR, load_trajectory
+from fk import TRAJECTORIES, forward_kinematics_RR, run_trajectory
 
 # The recording is in planar RR angles: theta1 = q1 + A1, theta2 = A2 - q4.
 A1 = np.arctan2(52.5, 293.0)
 A2 = np.arctan2(77.5, -418.5) - A1
-
-path = Path(sys.argv[1]) if len(sys.argv) > 1 else max(
-    (Path(__file__).parent / "recordings").glob("rr-*.npz"))
-theta1, theta2 = load_trajectory(path)
-rec = np.load(path)  # the rest of the recording: the pose, link lengths, rate
-home, rate = rec["home"], float(rec["rate"])
-l1, l2 = float(rec["l1"]), float(rec["l2"])
-print(f"replaying {path}: {len(theta1)} samples over {len(theta1) / rate:.1f}s")
+RECORDINGS = Path(__file__).parent / "recordings"
+START_SPEED = 0.3  # rad/s, for set_position's planned move
+MAX_SPEED = np.pi  # rad/s; a servo step faster than the joints can go is a bug
 
 
-def pose(th1, th2):
-    """The 7-joint command for one RR sample; the locked joints stay at home."""
-    q = home.copy()
-    q[0], q[3] = th1 - A1, A2 - th2
-    return q
+class RRArm:
+    """The xArm driven as the planar RR arm, drawn live with the student's FK."""
+
+    def __init__(self):
+        # Seen from in front of the robot: points go in as (y, x), +x pointing down.
+        plt.ion()
+        (x_lo, x_hi), (y_lo, y_hi), _ = DEFAULT_BOX
+        self.fig, self.ax = plt.subplots(figsize=(6, 6 * (x_hi - x_lo) / (y_hi - y_lo)))
+        ax = self.ax
+        ax.plot([y_lo, y_hi, y_hi, y_lo, y_lo], [x_lo, x_lo, x_hi, x_hi, x_lo],
+                color="tab:red", lw=1, label="safety box")
+        (self.recorded,) = ax.plot([], [], color="tab:orange", lw=2, label="recorded")
+        (self.trail,) = ax.plot([], [], color="tab:blue", lw=1, label="replayed")
+        (self.links,) = ax.plot([], [], "-o", color="tab:blue", lw=3, label="arm")
+        ax.set(xlim=(y_lo - 0.05, y_hi + 0.05), ylim=(x_hi + 0.05, x_lo - 0.05),
+               aspect="equal", xlabel="y (m)", ylabel="x (m)  — towards you")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize="small")
+        self.robot = Robot()
+
+    def new_trajectory(self, path, name):
+        """Take the locked pose and rate from the recording, and clear the plot."""
+        rec = np.load(path)
+        self.home, self.rate, self.xy = rec["home"], float(rec["rate"]), rec["xy"]
+        self.l1, self.l2 = float(rec["l1"]), float(rec["l2"])
+        self.name, self.measured, self.last, self.next_tick = name, [], None, None
+        self.recorded.set_data(*self.xy.T[::-1])
+        self.trail.set_data([], [])
+        self._redraw(f"{name} — waiting for set_position")
+
+    def set_position(self, theta1, theta2):
+        """Planned move to (theta1, theta2); returns once the arm has settled there."""
+        self._redraw(f"{self.name} — moving to start")
+        q = self._pose(theta1, theta2)
+        if not self.robot.set_joint_targets(q, speed=START_SPEED):
+            raise RuntimeError(f"{self.name}: the arm never reached the start pose")
+        self.last, self.next_tick = q, time.perf_counter()  # the stream starts from here
+        self._redraw(f"{self.name} — replaying")
+
+    def servo_to_position(self, theta1, theta2):
+        """Stream one sample, then wait out the rest of its 1/rate tick."""
+        if self.last is None:
+            raise RuntimeError("call arm.set_position before arm.servo_to_position")
+        q = self._pose(theta1, theta2)
+        step = np.max(np.abs(q - self.last))
+        if step > MAX_SPEED / self.rate:
+            raise RuntimeError(
+                f"{self.name}: a {step:.3f} rad jump in one sample — are the samples "
+                "in order, in radians, and theta1 / theta2 the right way round?")
+        self.robot.servo_joints(q)
+        self.last = q
+        self.measured.append(self._points(self.robot.joint_values)[2])
+        if len(self.measured) % max(1, round(self.rate / 20)) == 0:  # redraw at ~20 Hz
+            self._redraw()
+        self.next_tick += 1.0 / self.rate
+        time.sleep(max(0.0, self.next_tick - time.perf_counter()))
+
+    def report(self):
+        n = min(len(self.measured), len(self.xy))
+        if n == 0:
+            print(f"{self.name}: nothing was replayed")
+            return
+        error = np.linalg.norm(np.asarray(self.measured[:n]) - self.xy[:n], axis=1)
+        print(f"{self.name}: {len(self.measured)} of {len(self.xy)} samples replayed, "
+              f"xy tracking error max {error.max() * 1000:.1f} mm, "
+              f"rms {np.sqrt(np.mean(error ** 2)) * 1000:.1f} mm")
+        self._redraw(f"{self.name} — done")
+
+    def _pose(self, theta1, theta2):
+        """The 7-joint command for one RR sample; the locked joints stay at home."""
+        q = self.home.copy()
+        q[0], q[3] = theta1 - A1, A2 - theta2
+        return q
+
+    def _points(self, q):
+        """Base, elbow and end effector of the arm at `q`, by the student's FK."""
+        th = (q[0] + A1, A2 - q[3])
+        elbow = forward_kinematics_RR(*th, self.l1, 0.0)["H_6_0"][:2, 2]
+        end = forward_kinematics_RR(*th, self.l1, self.l2)["H_6_0"][:2, 2]
+        return np.array([[0.0, 0.0], elbow, end])
+
+    def _redraw(self, title=None):
+        if title:
+            self.ax.set_title(title)
+        self.links.set_data(*self._points(self.robot.joint_values).T[::-1])
+        if self.measured:
+            self.trail.set_data(*np.transpose(self.measured)[::-1])
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
 
 
-def arm_xy(q):
-    """Base, elbow and end effector of the arm at `q`, by the student's FK."""
-    th = (q[0] + A1, A2 - q[3])
-    elbow = forward_kinematics_RR(*th, l1, 0.0)["H_6_0"][:2, 2]
-    end = forward_kinematics_RR(*th, l1, l2)["H_6_0"][:2, 2]
-    return np.array([[0.0, 0.0], elbow, end])
-
-
-# Seen from in front of the robot: points go in as (y, x), +x pointing down.
-plt.ion()
-(x_lo, x_hi), (y_lo, y_hi), _ = DEFAULT_BOX
-fig, ax = plt.subplots(figsize=(6, 6 * (x_hi - x_lo) / (y_hi - y_lo)))
-ax.plot([y_lo, y_hi, y_hi, y_lo, y_lo], [x_lo, x_lo, x_hi, x_hi, x_lo],
-        color="tab:red", lw=1, label="safety box")
-ax.plot(*rec["xy"].T[::-1], color="tab:orange", lw=2, label="recorded")
-(trail,) = ax.plot([], [], color="tab:blue", lw=1, label="replayed")
-(links,) = ax.plot([], [], "-o", color="tab:blue", lw=3, label="arm")
-ax.set(xlim=(y_lo - 0.05, y_hi + 0.05), ylim=(x_hi + 0.05, x_lo - 0.05),
-       aspect="equal", xlabel="y (m)", ylabel="x (m)  — towards you",
-       title=path.name)
-ax.grid(alpha=0.3)
-ax.legend(loc="upper right", fontsize="small")
-plt.pause(0.1)
-
-robot = Robot()
-robot.set_joint_targets(pose(theta1[0], theta2[0]), speed=0.3)
-
-measured, drawn = [], 0.0
-start = time.perf_counter()
+if not TRAJECTORIES:
+    raise SystemExit("fk.TRAJECTORIES is empty — list the recordings to replay there.")
+arm = RRArm()
 try:
-    for k, (th1, th2) in enumerate(zip(theta1, theta2)):
-        robot.servo_joints(pose(th1, th2))
-        points = arm_xy(robot.joint_values)
-        measured.append(points[2])
-        if time.perf_counter() - drawn > 0.05:  # redraw at ~20 Hz
-            drawn = time.perf_counter()
-            links.set_data(*points.T[::-1])
-            trail.set_data(*np.transpose(measured)[::-1])
-            fig.canvas.draw_idle()
-            fig.canvas.flush_events()
-        time.sleep(max(0.0, start + k / rate - time.perf_counter()))
+    for i, name in enumerate(TRAJECTORIES, 1):
+        arm.new_trajectory(RECORDINGS / name, f"{i}/{len(TRAJECTORIES)}  {name}")
+        run_trajectory(arm, RECORDINGS / name)
+        arm.report()
 except KeyboardInterrupt:
     print("interrupted")
 finally:
-    robot.stop()
+    arm.robot.stop()
 
-error = np.linalg.norm(np.asarray(measured) - rec["xy"][:len(measured)], axis=1)
-print(f"xy tracking error: max {error.max() * 1000:.1f} mm, "
-      f"rms {np.sqrt(np.mean(error ** 2)) * 1000:.1f} mm")
 plt.ioff()
 plt.show()
