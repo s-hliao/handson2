@@ -35,8 +35,9 @@ to see it refused.
     3. the recording is saved to recordings/, and the arm drives back home —
        then straight back to 1 for the next recording.
 
-It only finishes on ctrl-c: during free drive that saves what was recorded
-and drives home first; anywhere else it stops the arm where it is.
+It only finishes on ctrl-c, which works at any point: a recording in progress
+is saved, and the arm is left stopped and holding where it is (the next run's
+first move takes it home). During a move, ctrl-c stops the arm at once.
 
 The recording is the RR joint angles, resampled onto an even grid at the
 free-drive rate (100 Hz) so that sample k is at k / rate, plus the elbow and
@@ -53,8 +54,10 @@ radians, like the rest of the library.
 """
 
 import argparse
+import contextlib
 import math
 import select
+import signal
 import sys
 import time
 from datetime import datetime
@@ -306,21 +309,66 @@ def flush_stdin():
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
 
 
-def wait_for_enter(message):
-    """Hold until someone presses enter. False if nobody is at the terminal.
+class CtrlC:
+    """Ctrl-c as a request to finish, noticed at the next safe point.
+
+    A KeyboardInterrupt goes off in whatever happens to be running. In free
+    drive that is mostly matplotlib redrawing inside Tk, whose callback wrapper
+    catches it, prints it as an error, and carries on. So inside this context
+    SIGINT only sets `requested`, which the free-drive tick and the prompts
+    check. Moves are the exception: ctrl-c during one should stop the arm at
+    once, which the library does on a KeyboardInterrupt, so `moving()` puts
+    that back for the move's duration. A second ctrl-c raises anyway, in
+    case something is stuck.
+    """
+
+    def __init__(self):
+        self.requested = False
+
+    def _handler(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        print("\n[goto] ctrl-c: finishing (again to force)")
+
+    def __enter__(self):
+        self._previous = signal.signal(signal.SIGINT, self._handler)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self._previous)
+
+    @contextlib.contextmanager
+    def moving(self):
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, self._handler)
+
+
+def wait_for_enter(message, ctrl_c, plot=None):
+    """Hold until someone presses enter. False on ctrl-c, or if nobody is at
+    the terminal.
 
     The guided phases gate on this even under `-y`: it is a beat to get hands
     clear, not a question. Nobody at the terminal means nobody watching the
     arm, so the caller skips instead. An enter pressed before the prompt
-    appeared doesn't count — it was meant for something else.
+    appeared doesn't count — it was meant for something else. Polled rather
+    than a blocking `input()`, so that ctrl-c is seen and the plot stays
+    responsive while it waits.
     """
     flush_stdin()
-    try:
-        input(message)
-        return True
-    except EOFError:
-        print("[goto] no terminal to pause at; skipping.")
-        return False
+    print(message, end="", flush=True)
+    while not ctrl_c.requested:
+        if select.select([sys.stdin], [], [], 0.05)[0]:
+            if sys.stdin.readline() == "":  # stdin closed: nobody there
+                print("\n[goto] no terminal to pause at; skipping.")
+                return False
+            return True
+        if plot is not None:
+            plot.idle()
+    return False
 
 
 def travel_timeout(start, goal, speed):
@@ -477,6 +525,11 @@ class LivePlot:
             self._blit()
         self.fig.canvas.flush_events()
 
+    def idle(self):
+        """Let the window handle its events while nothing is being drawn."""
+        if not self.closed:
+            self.fig.canvas.flush_events()
+
     def finish(self, title):
         """Draw the whole recording and say what became of it."""
         if self.closed:
@@ -509,6 +562,14 @@ def rr_recording(traj, t_start, home):
     dt = np.minimum(np.diff(t), 2 * period)
     t = np.concatenate([[0.0], np.cumsum(dt)])
 
+    # The controller reports positions less often than the loop samples them,
+    # so the raw angles are a staircase: each report held for a few ticks,
+    # then a jump. Only the ticks where a new report arrived carry anything,
+    # so interpolate between those, or a replay would servo every step.
+    fresh = np.concatenate([[True], np.any(np.diff(theta, axis=0) != 0, axis=1)])
+    fresh[-1] = True
+    t, theta = t[fresh], theta[fresh]
+
     # The loop's ticks jitter and occasionally overrun, so put the samples on
     # an exact 1/rate grid: sample k is then at k / rate, and the two angle
     # columns are all a replay needs — no timestamps to pace by.
@@ -523,8 +584,8 @@ def rr_recording(traj, t_start, home):
     )
 
 
-def guided_session(arm, home, folder, duration, plot):
-    """One free drive: position, record, save. True if ctrl-c ended it."""
+def guided_session(arm, home, folder, duration, plot, ctrl_c):
+    """One free drive: position, record, save."""
     from xarm7_lib.free_drive import FREE_JOINTS
 
     plot.reset()
@@ -534,6 +595,8 @@ def guided_session(arm, home, folder, duration, plot):
     state = {"t_start": None}
 
     def on_sample(t, q):
+        if ctrl_c.requested:
+            return True
         pressed = enter_pressed()
         if pressed and state["t_start"] is None:
             state["t_start"] = t
@@ -542,8 +605,14 @@ def guided_session(arm, home, folder, duration, plot):
         plot.update(q, recording=state["t_start"] is not None)
         return pressed
 
-    traj = arm.free_drive(FREE_JOINTS, duration, on_sample=on_sample)
-    interrupted = traj.reason == "interrupted"
+    def hands_off(message):
+        # The library's own prompt blocks in input(); this one sees ctrl-c.
+        print(message)
+        return wait_for_enter("        press enter when your hands are clear: ",
+                              ctrl_c, plot)
+
+    traj = arm.free_drive(FREE_JOINTS, duration, on_sample=on_sample,
+                          confirm=hands_off)
     print(f"[goto] {traj}")
     if arm.has_error:
         print("[goto] the controller latched an error during free drive; "
@@ -553,7 +622,7 @@ def guided_session(arm, home, folder, duration, plot):
     if state["t_start"] is None or not np.any(traj.t >= state["t_start"]):
         print("[goto] recording never started; nothing saved.")
         plot.finish("not recorded")
-        return interrupted
+        return
 
     recording = rr_recording(traj, state["t_start"], home)
     out = default_recording_path(folder)
@@ -566,10 +635,9 @@ def guided_session(arm, home, folder, duration, plot):
     if traj.interruptions:
         print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
     plot.finish(f"saved {out.name} — {t.size} samples")
-    return interrupted
 
 
-def return_home(arm, home, speed, box, controller_errors, ask):
+def return_home(arm, home, speed, box, controller_errors, ask, ctrl_c, plot):
     """Drive back to `home`. None once there, or the exit code if not."""
     print(f"[goto] returning to {degrees(home)} deg")
     if not preflight(arm.joint_values, home, box):
@@ -578,10 +646,12 @@ def return_home(arm, home, speed, box, controller_errors, ask):
               "re-run.")
         return 2
     if ask and not wait_for_enter(
-        f"[goto] hands clear — press enter to drive back at {speed} rad/s. "
+        f"[goto] hands clear — press enter to drive back at {speed} rad/s. ",
+        ctrl_c, plot,
     ):
-        return 1
-    reached, code = move_to(arm, home, speed, controller_errors)
+        return 0 if ctrl_c.requested else 1
+    with ctrl_c.moving():
+        reached, code = move_to(arm, home, speed, controller_errors)
     if code is not None:
         return code
     return None if reached else 1
@@ -607,24 +677,29 @@ def guided_loop(arm, home, args, box, controller_errors):
     folder = Path(args.out) if args.out else RECORDINGS
     speed = min(args.speed, RETURN_SPEED_CAP)
     plot = None
-    try:
-        if not wait_for_enter("[goto] hands clear, then press enter to start "
-                              "free drive. "):
-            return 1
-        while True:
-            if plot is None or plot.closed:
-                plot = LivePlot()
-            interrupted = guided_session(arm, home, folder, args.duration, plot)
-            code = return_home(arm, home, speed, box, controller_errors,
-                               ask=not args.yes)
-            if code is not None:
-                return code
-            if interrupted:
-                return 0
-    except KeyboardInterrupt:
-        arm.stop()
-        print("\n[goto] ctrl-c: done. The arm is stopped and holding.")
-        return 0
+    with CtrlC() as ctrl_c:
+        try:
+            if not wait_for_enter("[goto] hands clear, then press enter to "
+                                  "start free drive. ", ctrl_c):
+                return 0 if ctrl_c.requested else 1
+            while True:
+                if plot is None or plot.closed:
+                    plot = LivePlot()
+                if not ctrl_c.requested:
+                    guided_session(arm, home, folder, args.duration, plot, ctrl_c)
+                if ctrl_c.requested:
+                    # Free drive has already handed the arm back to position
+                    # control, so it is standing still wherever it was left.
+                    print("[goto] done. The arm is stopped and holding where it is.")
+                    return 0
+                code = return_home(arm, home, speed, box, controller_errors,
+                                   not args.yes, ctrl_c, plot)
+                if code is not None:
+                    return code
+        except KeyboardInterrupt:  # a second ctrl-c, or one during a move
+            arm.stop()
+            print("\n[goto] stopped. The arm is holding where it is.")
+            return 130
 
 
 # ----------------------------------------------------------------------
@@ -689,4 +764,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:  # outside the guided session: the arm's own
+        print("\n[goto] interrupted.")  # context has stopped it on the way out
+        sys.exit(130)

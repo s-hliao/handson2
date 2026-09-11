@@ -3,8 +3,8 @@
     python replay.py
 
 The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. Each
-trajectory is drawn with the student's FK: the recorded path, and the path the
-arm actually took as it replays.
+trajectory is drawn with the student's FK: the planned (recorded) path dotted,
+and the path the arm actually takes as it replays solid.
 """
 
 import time
@@ -21,7 +21,11 @@ A1 = np.arctan2(52.5, 293.0)
 A2 = np.arctan2(77.5, -418.5) - A1
 RECORDINGS = Path(__file__).parent / "recordings"
 START_SPEED = 0.3  # rad/s, for set_position's planned move
-MAX_SPEED = np.pi  # rad/s; a servo step faster than the joints can go is a bug
+# rad in one sample. Hand-guided motion moves a joint a few hundredths of a
+# radian per sample (more in an older recording, where the controller's slower
+# position reports show up as steps); a bigger jump is a bug in the student's
+# code — degrees, theta1/theta2 swapped, or samples skipped.
+MAX_STEP = 0.15
 
 
 class RRArm:
@@ -35,8 +39,10 @@ class RRArm:
         ax = self.ax
         ax.plot([y_lo, y_hi, y_hi, y_lo, y_lo], [x_lo, x_lo, x_hi, x_hi, x_lo],
                 color="tab:red", lw=1, label="safety box")
-        (self.recorded,) = ax.plot([], [], color="tab:orange", lw=2, label="recorded")
-        (self.trail,) = ax.plot([], [], color="tab:blue", lw=1, label="replayed")
+        # The planned path goes on top, so its dots still show where the two overlap.
+        (self.recorded,) = ax.plot([], [], ":", color="tab:orange", lw=2.5, zorder=3,
+                                   label="planned")
+        (self.trail,) = ax.plot([], [], "-", color="tab:blue", lw=1.5, label="actual")
         (self.links,) = ax.plot([], [], "-o", color="tab:blue", lw=3, label="arm")
         ax.set(xlim=(y_lo - 0.05, y_hi + 0.05), ylim=(x_hi + 0.05, x_lo - 0.05),
                aspect="equal", xlabel="y (m)", ylabel="x (m)  — towards you")
@@ -69,10 +75,10 @@ class RRArm:
             raise RuntimeError("call arm.set_position before arm.servo_to_position")
         q = self._pose(theta1, theta2)
         step = np.max(np.abs(q - self.last))
-        if step > MAX_SPEED / self.rate:
+        if step > MAX_STEP:
             raise RuntimeError(
-                f"{self.name}: a {step:.3f} rad jump in one sample — are the samples "
-                "in order, in radians, and theta1 / theta2 the right way round?")
+                f"{self.name}: a {step:.3f} rad jump at sample {len(self.measured)} — are "
+                "the samples in order, in radians, and theta1 / theta2 the right way round?")
         self.robot.servo_joints(q)
         self.last = q
         self.measured.append(self._points(self.robot.joint_values)[2])
