@@ -55,8 +55,8 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 import argparse
-import termios
 import select
+import termios
 import signal
 import math
 import sys
@@ -69,57 +69,6 @@ from live_plot import LivePlot
 from robot_info import LOCKED_ANGLES_DEG, LOCKED_INDICES, RECORD_RATE, q2rr
 
 RECORDINGS = Path(__file__).resolve().parent / "recordings"
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description=__doc__.splitlines()[0],
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--out",
-        help="folder to write the recordings to, each as rr-<timestamp>.csv "
-        "(default: recordings/)",
-    )
-    return parser.parse_args(argv)
-
-
-def default_recording_path(folder):
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path, n = Path(folder) / f"rr-{stamp}.csv", 1
-    while path.exists():  # two recordings inside the same second
-        n += 1
-        path = Path(folder) / f"rr-{stamp}-{n}.csv"
-    return path
-
-
-def degrees(q):
-    return "[" + ", ".join(f"{math.degrees(v):7.2f}" for v in q) + "]"
-
-
-def connect():
-    """The real arm. Refuses the simulation, which has nothing to push.
-
-    `Robot` picks the backend off ROBOT_IP and silently falls back to MuJoCo,
-    so say what is missing before it starts one, and check what came back.
-    """
-    if not os.environ.get("ROBOT_IP", "").strip():
-        raise SystemExit(
-            "[goto] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
-            "       Set it to the controller's address and run again."
-        )
-    arm = Robot()
-    if not isinstance(arm.robot, RealXArm7):
-        raise SystemExit("[goto] Robot() gave the simulation, not the real arm.")
-    return arm
-
-
-def flush_stdin():
-    """Throw away anything typed ahead, so only a fresh enter counts."""
-    if sys.stdin.isatty():
-
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
-
 
 class CtrlC:
     """Ctrl-c as a request to finish, noticed at the next safe point.
@@ -148,65 +97,43 @@ class CtrlC:
         signal.signal(signal.SIGINT, self._previous)
 
 
-def wait_for_enter(message, ctrl_c, plot=None):
-    """Hold until someone presses enter. False on ctrl-c, or if nobody is at
-    the terminal.
 
-    The guided phases gate on this even under `-y`: it is a beat to get hands
-    clear, not a question. Nobody at the terminal means nobody watching the
-    arm, so the caller skips instead. An enter pressed before the prompt
-    appeared doesn't count — it was meant for something else. Polled rather
-    than a blocking `input()`, so that ctrl-c is seen and the plot stays
-    responsive while it waits.
+def connect():
+    """Connect to the real arm. Refuses the simulation, which has nothing to push."""
+    if not os.environ.get("ROBOT_IP", "").strip():
+        raise SystemExit(
+            "[goto] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
+            "       Set it to the controller's address and run again."
+        )
+    arm = Robot()
+    if not isinstance(arm.robot, RealXArm7):
+        raise SystemExit("[goto] Robot() gave the simulation, not the real arm.")
+    return arm
+
+def prepare_start(arm):
+    """Move the arm to the locked pose, leaving the free joints wherever they are.
+
+    The locked joints are 2, 3, 5 and 6 at +90, +90, -90 and +90 degrees.
     """
-    flush_stdin()
-    print(message, end="", flush=True)
-    while not ctrl_c.requested:
-        if select.select([sys.stdin], [], [], 0.05)[0]:
-            if sys.stdin.readline() == "":  # stdin closed: nobody there
-                print("\n[goto] no terminal to pause at; skipping.")
-                return False
-            return True
-        if plot is not None:
-            plot.idle()
-    return False
-
-
-# ----------------------------------------------------------------------
-# The guided session
-# ----------------------------------------------------------------------
+    start = arm.joint_values
+    locked = start.copy()
+    locked[LOCKED_INDICES] = np.radians(LOCKED_ANGLES_DEG)
+    if not arm.set_joint_targets(locked):
+        raise RuntimeError("Arm never reached the locked pose.")
 
 
 def rr_recording(traj):
-    """A free-drive `Trajectory`, as the file's (N, 2) angles."""
-    t = traj.t
+    """A free-drive `Trajectory` as the file's (N, 2) angles, one row per tick."""
     theta = np.column_stack(q2rr(traj.q.T))
-
-    # Every time a watched joint had to be put back, the samples either side
-    # are seconds apart. The free joints are left where they were, so there
-    # is no jump across the seam — just a pause that isn't worth replaying.
-    period = 1.0 / traj.rate
-    dt = np.minimum(np.diff(t), 2 * period)
-    t = np.concatenate([[0.0], np.cumsum(dt)])
-
-    # The controller reports positions less often than the loop samples them,
-    # so the raw angles are a staircase: each report held for a few ticks,
-    # then a jump. Only the ticks where a new report arrived carry anything,
-    # so interpolate between those, or a replay would servo every step.
-    fresh = np.concatenate([[True], np.any(np.diff(theta, axis=0) != 0, axis=1)])
-    fresh[-1] = True
-    t, theta = t[fresh], theta[fresh]
-
-    # The loop's ticks jitter and occasionally overrun, so put the samples on
-    # an exact 1/RECORD_RATE grid: row k is then the arm at k / RECORD_RATE,
-    # and the two angle columns are all a replay needs — no timestamps to pace
-    # by, and no rate to read out of the file.
-    step = 1.0 / RECORD_RATE
-    grid = np.arange(0.0, t[-1] + step / 2, step)
-    return np.column_stack([np.interp(grid, t, column) for column in theta.T])
+    changed = np.any(np.diff(theta, axis=0) != 0, axis=1)
+    reports = np.flatnonzero(np.concatenate([[True], changed]))
+    ticks = np.arange(len(theta))
+    return np.column_stack(
+        [np.interp(ticks, reports, column[reports]) for column in theta.T]
+    )
 
 
-def guided_session(arm, folder, plot, ctrl_c):
+def guided_session(arm, out, plot, ctrl_c):
     """One free drive: record until ctrl-c, then save."""
     plot.reset("recording — ctrl-c to stop")
     print("[goto] free drive: push the arm through the path to record.\n"
@@ -217,28 +144,31 @@ def guided_session(arm, folder, plot, ctrl_c):
         return ctrl_c.requested  # True ends the run, and the arm holds where it is
 
     def hands_off(message):
-        # The library's own prompt blocks in input(); this one sees ctrl-c.
+        """Hold the recovery move until hands are clear. False ends the run.
+
+        The library's own prompt blocks in `input()`, which would sit on a
+        ctrl-c until someone pressed enter. Poll instead, so ctrl-c is noticed
+        and the plot keeps its window alive while it waits. A closed stdin
+        means nobody is at the terminal to say when it is safe, so the run
+        ends rather than moving the arm at them.
+        """
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)  # only a fresh enter counts
         print(message)
-        return wait_for_enter("        press enter when your hands are clear: ",
-                              ctrl_c, plot)
+        print("        press enter when your hands are clear: ", end="", flush=True)
+        while not ctrl_c.requested:
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                return sys.stdin.readline() != ""
+            plot.idle()
+        return False
 
     # math.inf: the run ends when `on_sample` says so, not on a clock.
     traj = arm.free_drive(FREE_JOINTS, math.inf,
                           on_sample=on_sample,
                           confirm=hands_off)
     print(f"[goto] {traj}")
-    if arm.robot.has_error:  # `Robot` doesn't forward these; the real arm has them
-        print("[goto] the controller latched an error during free drive; "
-              "clearing it.")
-        arm.robot.clear_errors()
-
-    if traj.t.size == 0:
-        print("[goto] nothing was recorded; nothing saved.")
-        plot.draw("not recorded", force=True)
-        return
 
     theta = rr_recording(traj)
-    out = default_recording_path(folder)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(out, theta, delimiter=",", fmt="%.10f",
                header=f"theta1,theta2 in radians, {RECORD_RATE:.0f} Hz")
@@ -247,51 +177,54 @@ def guided_session(arm, folder, plot, ctrl_c):
     print(f"[goto] sampled at {traj.rate:.0f} Hz; the controller's report was "
           f"seen changing at {traj.report_rate:.0f} Hz")
     if traj.interruptions:
-        print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
+        print(f"[goto] {traj.interruptions} interruption(s); those pauses are "
+              "not in the recording")
     plot.draw(f"saved {out.name} — {n} samples", force=True)
 
 
 # ----------------------------------------------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--out",
+        help="file to write the recording to "
+        "(default: recordings/rr-<timestamp>.csv)",
+    )
+    return parser.parse_args(argv)
+
+def default_recording_path():
+    """recordings/rr-<timestamp>.csv, stamped when free drive starts.
+
+    One run records once and takes longer than a second to do it, so two of
+    them can never land on the same name.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return RECORDINGS / f"rr-{stamp}.csv"
 
 
 def main(argv=None):
     args = parse_args(argv)
     np.set_printoptions(precision=3, suppress=True)
 
-    arm = connect()
+    robot = connect()
     # `Robot` isn't a context manager itself; the backend it wraps is, and its
     # exit is what puts the arm back in position control and disconnects.
-    with arm.robot:
-        start = arm.joint_values
-        # Only the locked joints are commanded; 1, 4 and 7 stay where they are,
-        # so the arm squares itself up without swinging the RR across the desk.
-        goal = start.copy()
-        goal[LOCKED_INDICES] = np.radians(LOCKED_ANGLES_DEG)
-        print(f"[goto] now at  {degrees(start)} deg")
-        print(f"[goto] going to {degrees(goal)} deg")
-        print("[goto]   (joints 2, 3, 5 and 6 to +-90; 1, 4 and 7 left alone)")
-
-        if not arm.set_joint_targets(goal):
-            print("[goto] not starting free drive: the arm never reached the pose.")
-            return 1
+    with robot.robot:
+        prepare_start(robot)
 
         # ---- free drive: one recording --------------------------------
         print("[goto] free drive: joints 1, 4 and 7 can be pushed by hand; 2, 3, "
               "5 and 6 are\n       watched, and the arm stops to put them back "
               "if they drift.\n       Everything is recorded; ctrl-c to stop and "
               "save.")
-        folder = Path(args.out) if args.out else RECORDINGS
+        out = Path(args.out) if args.out else default_recording_path()
         with CtrlC() as ctrl_c:
-            try:
-                guided_session(arm, folder, LivePlot(), ctrl_c)
-                # Free drive has already handed the arm back to position
-                # control, so it is standing still wherever it was left.
-                print("[goto] done. The arm is holding where it is.")
-                return 0
-            except KeyboardInterrupt:  # a second ctrl-c: something is stuck
-                arm.stop()
-                print("\n[goto] stopped. The arm is holding where it is.")
-                return 130
+            guided_session(robot, out, LivePlot(), ctrl_c)
+        return 0
 
 
 if __name__ == "__main__":
