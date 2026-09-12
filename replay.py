@@ -12,13 +12,12 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from xarm7_lib import DEFAULT_BOX, Robot
+from xarm7_lib import Robot
 
-from fk import TRAJECTORIES, forward_kinematics_RR, run_trajectory
+from fk import TRAJECTORIES, run_trajectory
+from live_plot import LivePlot
+from robot_info import rr_angles, rr_joints
 
-# The recording is in planar RR angles: theta1 = q1 + A1, theta2 = A2 - q4.
-A1 = np.arctan2(52.5, 293.0)
-A2 = np.arctan2(77.5, -418.5) - A1
 RECORDINGS = Path(__file__).parent / "recordings"
 START_SPEED = 0.3  # rad/s, for set_position's planned move
 # rad in one sample. Hand-guided motion moves a joint a few hundredths of a
@@ -32,33 +31,15 @@ class RRArm:
     """The xArm driven as the planar RR arm, drawn live with the student's FK."""
 
     def __init__(self):
-        # Seen from in front of the robot: points go in as (y, x), +x pointing down.
-        plt.ion()
-        (x_lo, x_hi), (y_lo, y_hi), _ = DEFAULT_BOX
-        self.fig, self.ax = plt.subplots(figsize=(6, 6 * (x_hi - x_lo) / (y_hi - y_lo)))
-        ax = self.ax
-        ax.plot([y_lo, y_hi, y_hi, y_lo, y_lo], [x_lo, x_lo, x_hi, x_hi, x_lo],
-                color="tab:red", lw=1, label="safety box")
-        # The planned path goes on top, so its dots still show where the two overlap.
-        (self.recorded,) = ax.plot([], [], ":", color="tab:orange", lw=2.5, zorder=3,
-                                   label="planned")
-        (self.trail,) = ax.plot([], [], "-", color="tab:blue", lw=1.5, label="actual")
-        (self.links,) = ax.plot([], [], "-o", color="tab:blue", lw=3, label="arm")
-        ax.set(xlim=(y_lo - 0.05, y_hi + 0.05), ylim=(x_hi + 0.05, x_lo - 0.05),
-               aspect="equal", xlabel="y (m)", ylabel="x (m)  — towards you")
-        ax.grid(alpha=0.3)
-        ax.legend(loc="upper right", fontsize="small")
+        self.plot = LivePlot(planned=True)
         self.robot = Robot()
 
     def new_trajectory(self, path, name):
         """Take the locked pose and rate from the recording, and clear the plot."""
         rec = np.load(path)
         self.home, self.rate, self.xy = rec["home"], float(rec["rate"]), rec["xy"]
-        self.l1, self.l2 = float(rec["l1"]), float(rec["l2"])
-        self.name, self.measured, self.last, self.next_tick = name, [], None, None
-        self.recorded.set_data(*self.xy.T[::-1])
-        self.trail.set_data([], [])
-        self._redraw(f"{name} — waiting for set_position")
+        self.name, self.last, self.next_tick = name, None, None
+        self.plot.reset(f"{name} — waiting for set_position", planned=self.xy)
 
     def set_position(self, theta1, theta2):
         """Planned move to (theta1, theta2); returns once the arm has settled there."""
@@ -81,11 +62,15 @@ class RRArm:
                 "the samples in order, in radians, and theta1 / theta2 the right way round?")
         self.robot.servo_joints(q)
         self.last = q
-        self.measured.append(self._points(self.robot.joint_values)[2])
-        if len(self.measured) % max(1, round(self.rate / 20)) == 0:  # redraw at ~20 Hz
-            self._redraw()
+        # the angles the arm really reached, drawn at the plot's own rate
+        self.plot.update(rr_angles(self.robot.joint_values))
         self.next_tick += 1.0 / self.rate
         time.sleep(max(0.0, self.next_tick - time.perf_counter()))
+
+    @property
+    def measured(self):
+        """The end-effector points the arm has actually been through."""
+        return self.plot.visited
 
     def report(self):
         n = min(len(self.measured), len(self.xy))
@@ -101,24 +86,13 @@ class RRArm:
     def _pose(self, theta1, theta2):
         """The 7-joint command for one RR sample; the locked joints stay at home."""
         q = self.home.copy()
-        q[0], q[3] = theta1 - A1, A2 - theta2
+        q[0], q[3] = rr_joints(theta1, theta2)
         return q
 
-    def _points(self, q):
-        """Base, elbow and end effector of the arm at `q`, by the student's FK."""
-        th = (q[0] + A1, A2 - q[3])
-        elbow = forward_kinematics_RR(*th, self.l1, 0.0)["H_6_0"][:2, 2]
-        end = forward_kinematics_RR(*th, self.l1, self.l2)["H_6_0"][:2, 2]
-        return np.array([[0.0, 0.0], elbow, end])
-
     def _redraw(self, title=None):
-        if title:
-            self.ax.set_title(title)
-        self.links.set_data(*self._points(self.robot.joint_values).T[::-1])
-        if self.measured:
-            self.trail.set_data(*np.transpose(self.measured)[::-1])
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
+        """Show where the arm is now, whatever the plot's own redraw rate."""
+        self.plot.update(rr_angles(self.robot.joint_values), record=False,
+                         title=title, force=True)
 
 
 if not TRAJECTORIES:

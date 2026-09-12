@@ -59,11 +59,12 @@ import math
 import select
 import signal
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+from live_plot import LivePlot
 
 # joints 1..7, degrees. Joints 2, 3, 5 and 6 are the "90 90 -90 90" that
 # makes the arm planar; 1 and 4 are the RR, here reaching out along +x.
@@ -82,7 +83,6 @@ _PLANAR_TOLERANCE = math.radians(3.0)
 
 DEFAULT_DURATION = 300.0  # s, a cap on each free drive
 RECORDINGS = Path(__file__).resolve().parent / "recordings"
-_REDRAW_PERIOD = 0.05  # s between plot redraws; the loop samples at 100 Hz
 
 # ----------------------------------------------------------------------
 # The planar RR, from UFACTORY's xarm7 model (joint origins in mm).
@@ -422,126 +422,6 @@ def out_of_plane(q):
     ]
 
 
-class LivePlot:
-    """The RR arm from above, drawn with the student's FK, updated live.
-
-    Drawn as seen by someone standing in front of the robot: the base at the
-    top, the arm reaching down the screen towards them (+x down), and the
-    robot's +y on their right. Every point is plotted as (y, x) on an inverted
-    vertical axis, so the ticks still read the robot's own coordinates. The
-    view is framed on the safety box's footprint.
-
-    `update` runs inside the free-drive watch loop, which has to keep watching
-    the locked joints, so it redraws at most every `_REDRAW_PERIOD` and then
-    only the two moving lines: the static background is cached and blitted,
-    which keeps a redraw to a few milliseconds instead of tens.
-    """
-
-    def __init__(self):
-        import matplotlib.pyplot as plt
-        from xarm7_lib.safety import DEFAULT_BOX
-
-        self.plt = plt
-        plt.ion()
-        (x_lo, x_hi), (y_lo, y_hi), _ = DEFAULT_BOX
-        self.fig, self.ax = plt.subplots(figsize=(6, 6 * (x_hi - x_lo) / (y_hi - y_lo)))
-        ax = self.ax
-        ax.plot([y_lo, y_hi, y_hi, y_lo, y_lo], [x_lo, x_lo, x_hi, x_hi, x_lo],
-                color="tab:red", lw=1, label="safety box")
-        ring = np.linspace(0, 2 * np.pi, 200)
-        for radius in (abs(L1 - L2), L1 + L2):
-            ax.plot(radius * np.sin(ring), radius * np.cos(ring),
-                    "--", color="0.7", lw=0.8)
-        # `animated` keeps them out of the cached background.
-        (self.path,) = ax.plot([], [], "-", color="tab:orange", lw=1.5,
-                               label="recorded", animated=True)
-        (self.links,) = ax.plot([], [], "-o", color="tab:blue", lw=3,
-                                label="arm (student FK)", animated=True)
-        margin = 0.05
-        ax.set_xlim(y_lo - margin, y_hi + margin)
-        ax.set_ylim(x_hi + margin, x_lo - margin)  # inverted: +x points down
-        ax.set_aspect("equal")
-        ax.set_xlabel("y (m)")
-        ax.set_ylabel("x (m)  — towards you")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize="small")
-
-        self.visited = []
-        self.recording = False
-        self.closed = False
-        self._background = None
-        self._drawn_at = -np.inf
-        canvas = self.fig.canvas
-        canvas.mpl_connect("close_event", self._on_close)
-        canvas.mpl_connect("draw_event", self._on_draw)
-        ax.title.set_animated(True)  # so the phase switch is only a blit
-        self.reset()
-        plt.show(block=False)
-        plt.pause(0.1)
-
-    def reset(self):
-        """Back to positioning, with nothing recorded on the plot."""
-        self.visited = []
-        self.recording = False
-        self.path.set_data([], [])
-        self.ax.set_title("positioning — press enter to start recording")
-        self._drawn_at = -np.inf
-
-    def _on_close(self, _event):
-        self.closed = True
-
-    def _on_draw(self, _event):
-        # Any full draw (the first, a resize, a new title) re-caches the
-        # background the moving lines are blitted onto.
-        self._background = self.fig.canvas.copy_from_bbox(self.fig.bbox)
-        self._blit()
-
-    def _blit(self):
-        canvas = self.fig.canvas
-        canvas.restore_region(self._background)
-        for artist in (self.ax.title, self.path, self.links):
-            self.ax.draw_artist(artist)
-        canvas.blit(self.fig.bbox)
-
-    def update(self, q, recording):
-        points = rr_points(*rr_angles(q))
-        self.links.set_data(points[:, 1], points[:, 0])  # (y, x)
-        if recording:
-            self.visited.append(points[2])
-        if recording and not self.recording:
-            # A fresh plot for each recording: only this one's points.
-            self.recording = True
-            self.visited = [points[2]]
-            self.ax.set_title("recording — press enter to stop")
-        now = time.perf_counter()
-        if self.closed or now - self._drawn_at < _REDRAW_PERIOD:
-            return
-        self._drawn_at = now
-        if self.visited:
-            self.path.set_data(*np.transpose(self.visited)[::-1])
-        if self._background is None:
-            self.fig.canvas.draw()  # full draw; `_on_draw` blits on top
-        else:
-            self._blit()
-        self.fig.canvas.flush_events()
-
-    def idle(self):
-        """Let the window handle its events while nothing is being drawn."""
-        if not self.closed:
-            self.fig.canvas.flush_events()
-
-    def finish(self, title):
-        """Draw the whole recording and say what became of it."""
-        if self.closed:
-            return
-        if self.visited:
-            self.path.set_data(*np.transpose(self.visited)[::-1])
-        self.ax.set_title(title)
-        if self._background is not None:
-            self._blit()
-        self.fig.canvas.flush_events()
-
-
 def enter_pressed():
     """True if enter has been pressed at the terminal, without blocking."""
     readable, _, _ = select.select([sys.stdin], [], [], 0)
@@ -588,7 +468,7 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
     """One free drive: position, record, save."""
     from xarm7_lib.free_drive import FREE_JOINTS
 
-    plot.reset()
+    plot.reset("positioning — press enter to start recording")
     flush_stdin()  # an extra enter from before must not start the recording
     print("[goto] free drive: move the arm to where the trajectory should "
           "start,\n       then press enter to record and enter again to stop.")
@@ -602,7 +482,9 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
             state["t_start"] = t
             print("[goto] recording — press enter to stop")
             pressed = False
-        plot.update(q, recording=state["t_start"] is not None)
+            # A fresh plot for each recording: only this one's points.
+            plot.reset("recording — press enter to stop")
+        plot.update(rr_angles(q), record=state["t_start"] is not None)
         return pressed
 
     def hands_off(message):
@@ -621,7 +503,7 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
 
     if state["t_start"] is None or not np.any(traj.t >= state["t_start"]):
         print("[goto] recording never started; nothing saved.")
-        plot.finish("not recorded")
+        plot.draw("not recorded", force=True)
         return
 
     recording = rr_recording(traj, state["t_start"], home)
@@ -634,7 +516,7 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
           f"seen changing at {traj.report_rate:.0f} Hz")
     if traj.interruptions:
         print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
-    plot.finish(f"saved {out.name} — {t.size} samples")
+    plot.draw(f"saved {out.name} — {t.size} samples", force=True)
 
 
 def return_home(arm, home, speed, box, controller_errors, ask, ctrl_c, plot):
