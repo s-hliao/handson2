@@ -20,6 +20,12 @@ RR_INDICES = np.array([0, 3])
 # wrist sits 478 mm in front of the base, near the robot's centre line.
 HOME_DEG = np.array([-70.0, 90.0, 90.0, 60.0, -90.0, 90.0, 0.0])
 
+# Hz. Free drive samples the arm this often, so goto.py writes its recordings
+# on this grid — row k is the arm at k / RECORD_RATE — and replay.py streams
+# them back at it. Nothing in a recording says what it was, so both ends read
+# it from here.
+RECORD_RATE = 100.0
+
 
 def robot_info():
     robot_info = {}
@@ -31,14 +37,14 @@ def robot_info():
     return robot_info
 
 
-def rr_angles(q):
+def q2rr(q):
     """(theta1, theta2) of the planar RR, from a 7-joint configuration."""
     A1 = np.arctan2(LINK1_MM[1], LINK1_MM[0])  # 10.16 deg
     A2 = np.arctan2(LINK2_MM[1], LINK2_MM[0]) - A1  # 159.35 deg
     return q[0] + A1, A2 - q[3]
 
 
-def rr_joints(theta1, theta2):
+def adjust_rr(theta1, theta2):
     """(q1, q4) of the arm, from the planar RR's angles — the inverse of `rr_angles`."""
     A1 = np.arctan2(LINK1_MM[1], LINK1_MM[0])  # 10.16 deg
     A2 = np.arctan2(LINK2_MM[1], LINK2_MM[0]) - A1  # 159.35 deg

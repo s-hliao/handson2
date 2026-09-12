@@ -15,8 +15,8 @@ import numpy as np
 from xarm7_lib import Robot
 
 from fk import TRAJECTORIES, run_trajectory
-from live_plot import LivePlot
-from robot_info import rr_angles, rr_joints
+from live_plot import LivePlot, arm_points
+from robot_info import HOME_DEG, RECORD_RATE, adjust_rr, q2rr
 
 RECORDINGS = Path(__file__).parent / "recordings"
 START_SPEED = 0.3  # rad/s, for set_position's planned move
@@ -33,11 +33,16 @@ class RRArm:
     def __init__(self):
         self.plot = LivePlot(planned=True)
         self.robot = Robot()
+        self.home = np.radians(HOME_DEG)  # the locked joints, at their nominal +-90
 
     def new_trajectory(self, path, name):
-        """Take the locked pose and rate from the recording, and clear the plot."""
-        rec = np.load(path)
-        self.home, self.rate, self.xy = rec["home"], float(rec["rate"]), rec["xy"]
+        """Read the angles to follow, and clear the plot.
+
+        The file holds those alone, so the path drawn to follow is them through
+        the student's FK.
+        """
+        theta = np.loadtxt(path, delimiter=",")
+        self.xy = np.array([arm_points(th) for th in theta])[:, 2]
         self.name, self.last, self.next_tick = name, None, None
         self.plot.reset(f"{name} — waiting for set_position", planned=self.xy)
 
@@ -63,8 +68,8 @@ class RRArm:
         self.robot.servo_joints(q)
         self.last = q
         # the angles the arm really reached, drawn at the plot's own rate
-        self.plot.update(rr_angles(self.robot.joint_values))
-        self.next_tick += 1.0 / self.rate
+        self.plot.update(q2rr(self.robot.joint_values))
+        self.next_tick += 1.0 / RECORD_RATE
         time.sleep(max(0.0, self.next_tick - time.perf_counter()))
 
     @property
@@ -86,12 +91,12 @@ class RRArm:
     def _pose(self, theta1, theta2):
         """The 7-joint command for one RR sample; the locked joints stay at home."""
         q = self.home.copy()
-        q[0], q[3] = rr_joints(theta1, theta2)
+        q[0], q[3] = adjust_rr(theta1, theta2)
         return q
 
     def _redraw(self, title=None):
         """Show where the arm is now, whatever the plot's own redraw rate."""
-        self.plot.update(rr_angles(self.robot.joint_values), record=False,
+        self.plot.update(q2rr(self.robot.joint_values), record=False,
                          title=title, force=True)
 
 

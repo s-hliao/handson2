@@ -2,9 +2,9 @@
 
     python goto.py
 
-`xarm7_lib.Robot` picks the arm: the real one when ROBOT_IP is set, the MuJoCo
-simulation otherwise — and free drive needs the real one, there being nothing
-to push in simulation.
+Set ROBOT_IP first: free drive is the controller's own teaching mode, so this
+script wants the real arm, and refuses the simulation `xarm7_lib.Robot` would
+otherwise fall back to.
 
 The target holds joints 2, 3, 5 and 6 at +90, +90, -90 and +90 degrees.
 That is the "90 90 -90 90" locked set, and it leaves joints 1, 4 and 7 with
@@ -34,39 +34,42 @@ It only finishes on ctrl-c, which works at any point: a recording in progress
 is saved, and the arm is left stopped and holding where it is (the next run's
 first move takes it home). During a move, ctrl-c stops the arm at once.
 
-The recording is the RR joint angles, resampled onto an even grid at the
-free-drive rate (100 Hz) so that sample k is at k / rate, plus the elbow and
-end-effector xy the student's FK puts them at:
+A recording is a plain csv of the RR joint angles and nothing else, two
+columns (theta1, theta2) in radians, resampled onto an even 100 Hz grid so
+that row k is the arm at k / 100 s:
 
-    t (N,)  theta (N,2)  q (N,2)  xy (N,2)  elbow_xy (N,2)  home (7,)  l1  l2  rate
+    # theta1,theta2 in radians, 100 Hz
+    -1.0442802157,2.8065783519
+    -1.0442798226,2.8065779411
+    ...
 
-`theta` is what `replay.py` streams back. The locked joints are replayed at
-their nominal +-90 (`home`), not at wherever they drifted to during the
-recording, so the replay lands on exactly the planar `xy` that was saved.
+That is what `replay.py` streams back. Everything else about the arm — the
+pose the locked joints are held at, the link lengths, where the FK puts the
+end effector — comes from `robot_info.py` and `fk.py` at replay time, not from
+the file. So a replay always uses today's `fk.py`, on the angles as recorded.
 
 The pose is printed in degrees; everything else here is radians, like the rest
 of the library.
 """
 
-import argparse
-import contextlib
-import math
-import select
-import signal
-import sys
 from datetime import datetime
 from pathlib import Path
-
 import numpy as np
+import contextlib
+import argparse
+import termios
+import select
+import signal
+import math
+import sys
+import os
+
+from xarm7_lib import RealXArm7, Robot, XArmError
+from xarm7_lib.free_drive import FREE_JOINTS
+from xarm7_lib.safety import SafetyError
 
 from live_plot import LivePlot
-
-# joints 1..7, degrees. Joints 2, 3, 5 and 6 are the "90 90 -90 90" that
-# makes the arm planar; 1 and 4 are the RR, here reaching out along +x.
-DEFAULT_TARGET_DEG = (-70.0, 90.0, 90.0, 60.0, -90.0, 90.0, 0.0)
-
-# The joints that must sit at +-90 for joints 1, 4 and 7 to be vertical.
-LOCKED_INDICES = (1, 2, 4, 5)
+from robot_info import HOME_DEG, LOCKED_INDICES, RECORD_RATE, q2rr
 
 DEFAULT_SPEED = 0.3  # rad/s, the library's own default
 RETURN_SPEED_CAP = 0.2  # rad/s; the return moves with people close to the arm
@@ -78,62 +81,6 @@ _PLANAR_TOLERANCE = math.radians(3.0)
 
 RECORDINGS = Path(__file__).resolve().parent / "recordings"
 
-# ----------------------------------------------------------------------
-# The planar RR, from UFACTORY's xarm7 model (joint origins in mm).
-# ----------------------------------------------------------------------
-# Shoulder (joint1) to elbow (joint4 axis): 293 out, 52.5 across.
-# Elbow to wrist (joint7 axis): 418.5 and 77.5 across the other way.
-L1 = math.hypot(293.0, 52.5) / 1000.0  # 0.2977 m
-L2 = math.hypot(418.5, 77.5) / 1000.0  # 0.4256 m
-# Those sideways offsets put the links at fixed angles to the joint zeros,
-# and joint 4's axis points down (-z), so it turns the forearm clockwise:
-#     theta1 = q1 + A1,   theta2 = A2 - q4
-A1 = math.atan2(52.5, 293.0)  # 10.16 deg
-A2 = math.atan2(77.5, -418.5) - A1  # 159.35 deg
-
-
-def rr_angles(q):
-    """(theta1, theta2) of the planar RR, from a 7-joint configuration."""
-    return q[0] + A1, A2 - q[3]
-
-
-def rr_points(theta1, theta2):
-    """Base, elbow and end effector in the plane, (3, 2) m, by the student's FK.
-
-    The elbow is the same FK with a zero-length forearm, which works whichever
-    way `fk.py` splits the chain into matrices.
-    """
-    from fk import forward_kinematics_RR
-
-    end = forward_kinematics_RR(theta1, theta2, L1, L2)["H_6_0"]
-    elbow = forward_kinematics_RR(theta1, theta2, L1, 0.0)["H_6_0"]
-    return np.array([[0.0, 0.0], elbow[:2, 2], end[:2, 2]])
-
-
-def check_fk(q):
-    """Refuse to start unless `fk.py` puts the wrist where the arm really is.
-
-    Checked against the closed form here rather than trusted, so an unfinished
-    or wrong FK is found at the terminal, not halfway through a session.
-    """
-    theta1, theta2 = rr_angles(q)
-    expected = np.array([
-        L1 * math.cos(theta1) + L2 * math.cos(theta1 + theta2),
-        L1 * math.sin(theta1) + L2 * math.sin(theta1 + theta2),
-    ])
-    try:
-        got = rr_points(theta1, theta2)[2]
-    except Exception as err:  # the stub returns None, the student's may raise
-        raise SystemExit(f"[goto] fk.py isn't finished yet ({type(err).__name__}: "
-                         f"{err}); complete forward_kinematics_RR first.")
-    miss = float(np.linalg.norm(got - expected))
-    if miss > 1e-3:
-        raise SystemExit(
-            f"[goto] fk.py puts the wrist at {np.round(got, 3)} m, but the arm "
-            f"would be at {np.round(expected, 3)} m ({miss * 1000:.0f} mm off).\n"
-            "       Fix forward_kinematics_RR before hand-guiding the arm."
-        )
-
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -142,7 +89,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--out",
-        help="folder to write the recordings to, each as rr-<timestamp>.npz "
+        help="folder to write the recordings to, each as rr-<timestamp>.csv "
         "(default: recordings/)",
     )
     return parser.parse_args(argv)
@@ -150,10 +97,10 @@ def parse_args(argv=None):
 
 def default_recording_path(folder):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path, n = Path(folder) / f"rr-{stamp}.npz", 1
+    path, n = Path(folder) / f"rr-{stamp}.csv", 1
     while path.exists():  # two recordings inside the same second
         n += 1
-        path = Path(folder) / f"rr-{stamp}-{n}.npz"
+        path = Path(folder) / f"rr-{stamp}-{n}.csv"
     return path
 
 
@@ -161,37 +108,21 @@ def degrees(q):
     return "[" + ", ".join(f"{math.degrees(v):7.2f}" for v in q) + "]"
 
 
-def preflight(start, goal):
-    """Report on the pose and on the straight line to it. True if both are clear."""
-    from xarm7_lib.safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyGuard
-
-    print("[goto] loading the collision model...")
-    guard = SafetyGuard(box=DEFAULT_BOX, margin=DEFAULT_MARGIN)
-
-    pose = guard.check(goal)
-    print(f"[goto] target pose: {'allowed' if pose is None else pose}")
-
-    path, reached = guard.check_path(start, goal)
-    if path is None:
-        print("[goto] path from here: clear the whole way")
-    else:
-        # `reached` is the fraction of the line that is safe, so this is the
-        # furthest the arm could legally get before something touches.
-        stopped = start + reached * (goal - start)
-        print(f"[goto] path from here: {path}")
-        print(f"[goto]   clear for {reached * 100:.0f}% of the way, to {degrees(stopped)}")
-    return pose is None and path is None
-
-
 def connect():
-    """The arm this run drives: the real one if ROBOT_IP is set, else the sim.
+    """The real arm. Refuses the simulation, which has nothing to push.
 
-    Imported here rather than at the top so that importing this module costs
-    nothing but the standard library and numpy.
+    `Robot` picks the backend off ROBOT_IP and silently falls back to MuJoCo,
+    so say what is missing before it starts one, and check what came back.
     """
-    from xarm7_lib import Robot
-
-    return Robot()
+    if not os.environ.get("ROBOT_IP", "").strip():
+        raise SystemExit(
+            "[goto] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
+            "       Set it to the controller's address and run again."
+        )
+    arm = Robot()
+    if not isinstance(arm.robot, RealXArm7):
+        raise SystemExit("[goto] Robot() gave the simulation, not the real arm.")
+    return arm
 
 
 def confirm(question):
@@ -204,7 +135,6 @@ def confirm(question):
 def flush_stdin():
     """Throw away anything typed ahead, so only a fresh enter counts."""
     if sys.stdin.isatty():
-        import termios
 
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
 
@@ -279,9 +209,6 @@ def travel_timeout(start, goal, speed):
 def move_to(arm, goal, speed):
     """Drive to `goal`. Returns (reached, exit code) — the code is None if the
     move was allowed to happen at all, whatever came of it."""
-    from xarm7_lib import XArmError
-    from xarm7_lib.safety import SafetyError
-
     try:
         reached = arm.set_joint_targets(
             goal, speed=speed, wait=True,
@@ -330,11 +257,11 @@ def enter_pressed():
     return bool(readable) and sys.stdin.readline() != ""
 
 
-def rr_recording(traj, t_start, home):
-    """The recorded part of a free-drive `Trajectory`, as the RR file's arrays."""
+def rr_recording(traj, t_start):
+    """The recorded part of a free-drive `Trajectory`, as the file's (N, 2) angles."""
     keep = traj.t >= t_start
     t = traj.t[keep]
-    theta = np.column_stack(rr_angles(traj.q[keep].T))
+    theta = np.column_stack(q2rr(traj.q[keep].T))
 
     # Every time a watched joint had to be put back, the samples either side
     # are seconds apart. The free joints are left where they were, so there
@@ -352,23 +279,16 @@ def rr_recording(traj, t_start, home):
     t, theta = t[fresh], theta[fresh]
 
     # The loop's ticks jitter and occasionally overrun, so put the samples on
-    # an exact 1/rate grid: sample k is then at k / rate, and the two angle
-    # columns are all a replay needs — no timestamps to pace by.
-    grid = np.arange(0.0, t[-1] + period / 2, period)
-    theta = np.column_stack([np.interp(grid, t, column) for column in theta.T])
-    q = np.column_stack([theta[:, 0] - A1, A2 - theta[:, 1]])
-
-    points = np.array([rr_points(a, b) for a, b in theta])
-    return dict(
-        t=grid, theta=theta, q=q, xy=points[:, 2], elbow_xy=points[:, 1],
-        home=np.asarray(home, dtype=float), l1=L1, l2=L2, rate=traj.rate,
-    )
+    # an exact 1/RECORD_RATE grid: row k is then the arm at k / RECORD_RATE,
+    # and the two angle columns are all a replay needs — no timestamps to pace
+    # by, and no rate to read out of the file.
+    step = 1.0 / RECORD_RATE
+    grid = np.arange(0.0, t[-1] + step / 2, step)
+    return np.column_stack([np.interp(grid, t, column) for column in theta.T])
 
 
-def guided_session(arm, home, folder, plot, ctrl_c):
+def guided_session(arm, folder, plot, ctrl_c):
     """One free drive: position, record, save."""
-    from xarm7_lib.free_drive import FREE_JOINTS
-
     plot.reset("positioning — press enter to start recording")
     flush_stdin()  # an extra enter from before must not start the recording
     print("[goto] free drive: move the arm to where the trajectory should "
@@ -385,7 +305,7 @@ def guided_session(arm, home, folder, plot, ctrl_c):
             pressed = False
             # A fresh plot for each recording: only this one's points.
             plot.reset("recording — press enter to stop")
-        plot.update(rr_angles(q), record=state["t_start"] is not None)
+        plot.update(q2rr(q), record=state["t_start"] is not None)
         return pressed
 
     def hands_off(message):
@@ -408,27 +328,23 @@ def guided_session(arm, home, folder, plot, ctrl_c):
         plot.draw("not recorded", force=True)
         return
 
-    recording = rr_recording(traj, state["t_start"], home)
+    theta = rr_recording(traj, state["t_start"])
     out = default_recording_path(folder)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **recording)
-    t = recording["t"]
-    print(f"[goto] {t.size} samples over {t[-1]:.1f}s written to {out}")
+    np.savetxt(out, theta, delimiter=",", fmt="%.10f",
+               header=f"theta1,theta2 in radians, {RECORD_RATE:.0f} Hz")
+    n = len(theta)
+    print(f"[goto] {n} samples over {n / RECORD_RATE:.1f}s written to {out}")
     print(f"[goto] sampled at {traj.rate:.0f} Hz; the controller's report was "
           f"seen changing at {traj.report_rate:.0f} Hz")
     if traj.interruptions:
         print(f"[goto] {traj.interruptions} interruption(s) were closed up in t")
-    plot.draw(f"saved {out.name} — {t.size} samples", force=True)
+    plot.draw(f"saved {out.name} — {n} samples", force=True)
 
 
 def return_home(arm, home, speed, ctrl_c, plot):
     """Drive back to `home`. None once there, or the exit code if not."""
     print(f"[goto] returning to {degrees(home)} deg")
-    if not preflight(arm.joint_values, home):
-        print("[goto] the way back isn't clear from where the arm was "
-              "left.\n       Leaving it as it is — move it clear and "
-              "re-run.")
-        return 2
     if not wait_for_enter(
         f"[goto] hands clear — press enter to drive back at {speed} rad/s. ",
         ctrl_c, plot,
@@ -436,6 +352,9 @@ def return_home(arm, home, speed, ctrl_c, plot):
         return 0 if ctrl_c.requested else 1
     with ctrl_c.moving():
         reached, code = move_to(arm, home, speed)
+    if code == 2:  # the arm's guard refused it: free drive left it somewhere awkward
+        print("[goto] the way back isn't clear from where the arm was "
+              "left.\n       Leaving it as it is — move it clear and re-run.")
     if code is not None:
         return code
     return None if reached else 1
@@ -469,7 +388,7 @@ def guided_loop(arm, home, args):
                 if plot is None or plot.closed:
                     plot = LivePlot()
                 if not ctrl_c.requested:
-                    guided_session(arm, home, folder, plot, ctrl_c)
+                    guided_session(arm, folder, plot, ctrl_c)
                 if ctrl_c.requested:
                     # Free drive has already handed the arm back to position
                     # control, so it is standing still wherever it was left.
@@ -489,9 +408,8 @@ def guided_loop(arm, home, args):
 
 def main(argv=None):
     args = parse_args(argv)
-    goal = np.radians(DEFAULT_TARGET_DEG)
+    goal = np.radians(HOME_DEG)
     np.set_printoptions(precision=3, suppress=True)
-    check_fk(goal)
 
     arm = connect()
     # `Robot` isn't a context manager itself; the backend it wraps is, and its
@@ -500,10 +418,6 @@ def main(argv=None):
         start = arm.joint_values
         print(f"[goto] now at  {degrees(start)} deg")
         print(f"[goto] going to {degrees(goal)} deg at {DEFAULT_SPEED} rad/s")
-
-        if not preflight(start, goal):
-            print("[goto] refusing to command a pose the collision model rejects.")
-            return 2
 
         if not confirm("Clear the workspace. Move now?"):
             return 1

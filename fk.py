@@ -42,30 +42,30 @@ def load_trajectory(path):
     """
     Loads a trajectory recorded by `goto.py --guided` and returns its RR joint angles.
 
-    The recording is a NumPy .npz file. np.load(path) returns a dictionary-like object;
-    the entries you need are:
-        'theta'  shape (N, 2)  joint angles in radians, one row per sample:
-                               column 0 is theta1, column 1 is theta2
-        'rate'   a number      samples per second; sample k was taken at k / rate seconds
+    The recording is a comma-separated text file, one row per sample, taken at
+    100 Hz — so sample k was taken at k / 100 seconds. Each row is two joint angles
+    in radians: column 0 is theta1, column 1 is theta2. np.loadtxt(path, delimiter=',')
+    reads the whole thing into one (N, 2) array (the header line is a comment, and
+    numpy skips it).
 
     Returns two NumPy arrays, theta1 and theta2, each of length N and aligned in time:
     theta1[k] and theta2[k] are the two joint angles at the same instant.
     """
     # To-Do 3: Load the recording at `path`
-    data = np.load(path)
+    data = np.loadtxt(path, delimiter=',')
 
     # To-Do 4: Split the (N, 2) array of joint angles into one array per joint
-    theta1 = data['theta'][:, 0]
-    theta2 = data['theta'][:, 1]
+    theta1 = data[:, 0]
+    theta2 = data[:, 1]
 
     return theta1, theta2
 
 
 # To-Do 5: List the recordings replay.py should play, by file name, in the order to play them.
-# goto.py saves each one in the recordings folder as rr-<date>-<time>.npz, for example
-#     TRAJECTORIES = ["rr-20260911-101500.npz", "rr-20260911-102233.npz"]
+# goto.py saves each one in the recordings folder as rr-<date>-<time>.csv, for example
+#     TRAJECTORIES = ["rr-20260911-101500.csv", "rr-20260911-102233.csv"]
 # (For now: every recording in the folder, oldest first.)
-TRAJECTORIES = sorted(path.name for path in (Path(__file__).parent / "recordings").glob("rr-*.npz"))
+TRAJECTORIES = sorted(path.name for path in (Path(__file__).parent / "recordings").glob("rr-*.csv"))
 
 
 def run_trajectory(arm, path):
