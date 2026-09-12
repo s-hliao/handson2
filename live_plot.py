@@ -18,23 +18,19 @@ import time
 from xarm7_lib.safety import DEFAULT_BOX
 
 from fk import forward_kinematics_RR
-from robot_info import robot_info
 
 _REDRAW_PERIOD = 0.05  # s between redraws; goto's free-drive loop samples at 100 Hz
-L1, L2 = robot_info()['link_lengths']
 
 
 def arm_points(q):
     """Base, elbow and end effector at `q` = (theta1, theta2), (3, 2) m, by the
     student's FK.
 
-    The elbow is the same FK with a zero-length forearm, which works whichever
-    way `fk.py` splits the chain into matrices.
+    The two frames the base can see: `H_2_0` is the elbow and `H_4_0` the end
+    effector, so the arm is those two origins hung off the base.
     """
-    theta1, theta2 = q
-    elbow = forward_kinematics_RR(theta1, theta2, L1, 0.0)["H_6_0"]
-    end = forward_kinematics_RR(theta1, theta2, L1, L2)["H_6_0"]
-    return np.array([[0.0, 0.0], elbow[:2, 2], end[:2, 2]])
+    H = forward_kinematics_RR(*q)
+    return np.array([[0.0, 0.0], H["H_2_0"][:2, 2], H["H_4_0"][:2, 2]])
 
 
 class LivePlot:

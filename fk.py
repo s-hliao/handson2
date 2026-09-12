@@ -1,14 +1,21 @@
 import numpy as np
 
+from robot_info import robot_info
 
-def forward_kinematics_RR(theta1, theta2, l1, l2):
+
+def forward_kinematics_RR(theta1, theta2):
     """
     Returns the forward kinematics for an RR robot given the joint angle positions in radians.
+
+    The link lengths are the arm's own, from `robot_info.py`.
     """
     # NOTE: The convention is that links in 2D lie along the x-axis of the starting frame,
     # and the joint angles are measured counter-clockwise from the x-axis of the previous link.
+    l1, l2 = robot_info()['link_lengths']
 
-    # To-Do 1: Compute the homogeneous transformation matrices H_1_0, H_2_1, H_3_2, H_4_3, H_5_4, H_6_5
+    # To-Do 1: Compute the homogeneous transformation matrices H_1_0, H_2_1, H_3_2,
+    # H_4_3, then compose the two the base can see: H_2_0 (the elbow) and H_4_0 (the
+    # end effector).
     c1, s1 = np.cos(theta1), np.sin(theta1)
     c2, s2 = np.cos(theta2), np.sin(theta2)
     H_1_0 = np.array([[c1, -s1, 0.0],     # rotate by theta1 at the base
@@ -24,14 +31,12 @@ def forward_kinematics_RR(theta1, theta2, l1, l2):
                       [0.0, 1.0, 0.0],
                       [0.0, 0.0, 1.0]])
 
-    H_4_0 = H_1_0 @ H_2_1 @ H_3_2 @ H_4_3
+    H_2_0 = H_1_0 @ H_2_1
+    H_4_0 = H_2_0 @ H_3_2 @ H_4_3
 
     return {
-        'H_1_0': H_1_0,
-        'H_2_1': H_2_1,
-        'H_3_2': H_3_2,
-        'H_4_3': H_4_3,
-        'H_6_0': H_4_0
+        'H_2_0': H_2_0,  # the elbow, in the base frame
+        'H_4_0': H_4_0,  # the end effector, in the base frame
     }
 
 
