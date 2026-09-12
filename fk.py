@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import numpy as np
 
 
@@ -26,7 +24,6 @@ def forward_kinematics_RR(theta1, theta2, l1, l2):
                       [0.0, 1.0, 0.0],
                       [0.0, 0.0, 1.0]])
 
-    # To-Do 2: Compute the homogeneous transformation matrix H_6_0
     H_4_0 = H_1_0 @ H_2_1 @ H_3_2 @ H_4_3
 
     return {
@@ -51,21 +48,10 @@ def load_trajectory(path):
     Returns two NumPy arrays, theta1 and theta2, each of length N and aligned in time:
     theta1[k] and theta2[k] are the two joint angles at the same instant.
     """
-    # To-Do 3: Load the recording at `path`
     data = np.loadtxt(path, delimiter=',')
-
-    # To-Do 4: Split the (N, 2) array of joint angles into one array per joint
     theta1 = data[:, 0]
     theta2 = data[:, 1]
-
     return theta1, theta2
-
-
-# To-Do 5: List the recordings replay.py should play, by file name, in the order to play them.
-# goto.py saves each one in the recordings folder as rr-<date>-<time>.csv, for example
-#     TRAJECTORIES = ["rr-20260911-101500.csv", "rr-20260911-102233.csv"]
-# (For now: every recording in the folder, oldest first.)
-TRAJECTORIES = sorted(path.name for path in (Path(__file__).parent / "recordings").glob("rr-*.csv"))
 
 
 def run_trajectory(arm, path):
@@ -78,12 +64,9 @@ def run_trajectory(arm, path):
     Streaming has to start from where the arm already is, so move it to the first
     sample before servoing through the rest.
     """
-    # To-Do 6: Load the recording's joint angles
     theta1, theta2 = load_trajectory(path)
 
-    # To-Do 7: Move the arm to the first sample
+    # To-Do 2: Command the arm to follow loaded trajectory.
     arm.set_position(theta1[0], theta2[0])
-
-    # To-Do 8: Servo through every sample, in order
     for k in range(len(theta1)):
         arm.servo_to_position(theta1[k], theta2[k])

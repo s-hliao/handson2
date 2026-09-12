@@ -1,12 +1,14 @@
-"""Replay the recordings listed in fk.TRAJECTORIES, in order, with the student's run_trajectory.
+"""Replay one recording with the student's run_trajectory.
 
-    python replay.py
+    python replay.py rr-20260911-101500.csv     # from recordings/
+    python replay.py some/where/else.csv        # or from anywhere
 
-The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. Each
+The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. The
 trajectory is drawn with the student's FK: the planned (recorded) path dotted,
 and the path the arm actually takes as it replays solid.
 """
 
+import argparse
 import time
 from pathlib import Path
 
@@ -14,9 +16,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from xarm7_lib import Robot
 
-from fk import TRAJECTORIES, run_trajectory
+from fk import run_trajectory
 from live_plot import LivePlot, arm_points
-from robot_info import HOME_DEG, RECORD_RATE, adjust_rr, q2rr
+from robot_info import RECORD_RATE, q2rr, rr2q
 
 RECORDINGS = Path(__file__).parent / "recordings"
 START_SPEED = 0.3  # rad/s, for set_position's planned move
@@ -33,9 +35,8 @@ class RRArm:
     def __init__(self):
         self.plot = LivePlot(planned=True)
         self.robot = Robot()
-        self.home = np.radians(HOME_DEG)  # the locked joints, at their nominal +-90
 
-    def new_trajectory(self, path, name):
+    def new_trajectory(self, path):
         """Read the angles to follow, and clear the plot.
 
         The file holds those alone, so the path drawn to follow is them through
@@ -43,13 +44,13 @@ class RRArm:
         """
         theta = np.loadtxt(path, delimiter=",")
         self.xy = np.array([arm_points(th) for th in theta])[:, 2]
-        self.name, self.last, self.next_tick = name, None, None
-        self.plot.reset(f"{name} — waiting for set_position", planned=self.xy)
+        self.name, self.last, self.next_tick = path.name, None, None
+        self.plot.reset(f"{self.name} — waiting for set_position", planned=self.xy)
 
     def set_position(self, theta1, theta2):
         """Planned move to (theta1, theta2); returns once the arm has settled there."""
         self._redraw(f"{self.name} — moving to start")
-        q = self._pose(theta1, theta2)
+        q = rr2q(theta1, theta2)
         if not self.robot.set_joint_targets(q, speed=START_SPEED):
             raise RuntimeError(f"{self.name}: the arm never reached the start pose")
         self.last, self.next_tick = q, time.perf_counter()  # the stream starts from here
@@ -59,7 +60,7 @@ class RRArm:
         """Stream one sample, then wait out the rest of its 1/rate tick."""
         if self.last is None:
             raise RuntimeError("call arm.set_position before arm.servo_to_position")
-        q = self._pose(theta1, theta2)
+        q = rr2q(theta1, theta2)
         step = np.max(np.abs(q - self.last))
         if step > MAX_STEP:
             raise RuntimeError(
@@ -88,30 +89,42 @@ class RRArm:
               f"rms {np.sqrt(np.mean(error ** 2)) * 1000:.1f} mm")
         self._redraw(f"{self.name} — done")
 
-    def _pose(self, theta1, theta2):
-        """The 7-joint command for one RR sample; the locked joints stay at home."""
-        q = self.home.copy()
-        q[0], q[3] = adjust_rr(theta1, theta2)
-        return q
-
     def _redraw(self, title=None):
         """Show where the arm is now, whatever the plot's own redraw rate."""
         self.plot.update(q2rr(self.robot.joint_values), record=False,
                          title=title, force=True)
 
 
-if not TRAJECTORIES:
-    raise SystemExit("fk.TRAJECTORIES is empty — list the recordings to replay there.")
-arm = RRArm()
-try:
-    for i, name in enumerate(TRAJECTORIES, 1):
-        arm.new_trajectory(RECORDINGS / name, f"{i}/{len(TRAJECTORIES)}  {name}")
-        run_trajectory(arm, RECORDINGS / name)
-        arm.report()
-except KeyboardInterrupt:
-    print("interrupted")
-finally:
-    arm.robot.stop()
+def recording_path(name):
+    """The file to play. A name with no folder is looked for in recordings/,
+    so the file name goto.py prints when it saves can be pasted straight in."""
+    path = Path(name)
+    if not path.exists():
+        path = RECORDINGS / name
+    if not path.exists():
+        raise SystemExit(f"no such recording: {name}")
+    return path
 
-plt.ioff()
-plt.show()
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("recording", help="the recording to replay, by path or "
+                                          "by name within recordings/")
+    path = recording_path(parser.parse_args(argv).recording)
+
+    arm = RRArm()
+    try:
+        arm.new_trajectory(path)
+        run_trajectory(arm, path)
+        arm.report()
+    except KeyboardInterrupt:
+        print("interrupted")
+    finally:
+        arm.robot.stop()
+
+    plt.ioff()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

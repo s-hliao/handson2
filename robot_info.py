@@ -44,8 +44,15 @@ def q2rr(q):
     return q[0] + A1, A2 - q[3]
 
 
-def adjust_rr(theta1, theta2):
-    """(q1, q4) of the arm, from the planar RR's angles — the inverse of `rr_angles`."""
+def rr2q(theta1, theta2):
+    """The 7-joint configuration at the planar RR's (theta1, theta2).
+
+    The inverse of `q2rr`, filled out the only way it can be: the locked
+    joints at their nominal +-90 and joint 7 at zero, which is `HOME_DEG`
+    with joints 1 and 4 set from the angles.
+    """
     A1 = np.arctan2(LINK1_MM[1], LINK1_MM[0])  # 10.16 deg
     A2 = np.arctan2(LINK2_MM[1], LINK2_MM[0]) - A1  # 159.35 deg
-    return theta1 - A1, A2 - theta2
+    q = np.radians(HOME_DEG)
+    q[0], q[3] = theta1 - A1, A2 - theta2
+    return q

@@ -68,7 +68,6 @@ from xarm7_lib.free_drive import FREE_JOINTS
 from live_plot import LivePlot
 from robot_info import LOCKED_ANGLES_DEG, LOCKED_INDICES, RECORD_RATE, q2rr
 
-RECORDINGS = Path(__file__).resolve().parent / "recordings"
 
 class CtrlC:
     """Ctrl-c as a request to finish, noticed at the next safe point.
@@ -95,7 +94,6 @@ class CtrlC:
 
     def __exit__(self, *exc):
         signal.signal(signal.SIGINT, self._previous)
-
 
 
 def connect():
@@ -133,7 +131,7 @@ def rr_recording(traj):
     )
 
 
-def guided_session(arm, out, plot, ctrl_c):
+def guided_session(arm: Robot, out, plot, ctrl_c):
     """One free drive: record until ctrl-c, then save."""
     plot.reset("recording — ctrl-c to stop")
     print("[goto] free drive: push the arm through the path to record.\n"
@@ -143,7 +141,7 @@ def guided_session(arm, out, plot, ctrl_c):
         plot.update(q2rr(q))
         return ctrl_c.requested  # True ends the run, and the arm holds where it is
 
-    def hands_off(message):
+    def pause_until_safe(message):
         """Hold the recovery move until hands are clear. False ends the run.
 
         The library's own prompt blocks in `input()`, which would sit on a
@@ -163,10 +161,9 @@ def guided_session(arm, out, plot, ctrl_c):
         return False
 
     # math.inf: the run ends when `on_sample` says so, not on a clock.
-    traj = arm.free_drive(FREE_JOINTS, math.inf,
+    traj = arm.free_drive(FREE_JOINTS, duration=math.inf,
                           on_sample=on_sample,
-                          confirm=hands_off)
-    print(f"[goto] {traj}")
+                          confirm=pause_until_safe)
 
     theta = rr_recording(traj)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -174,15 +171,7 @@ def guided_session(arm, out, plot, ctrl_c):
                header=f"theta1,theta2 in radians, {RECORD_RATE:.0f} Hz")
     n = len(theta)
     print(f"[goto] {n} samples over {n / RECORD_RATE:.1f}s written to {out}")
-    print(f"[goto] sampled at {traj.rate:.0f} Hz; the controller's report was "
-          f"seen changing at {traj.report_rate:.0f} Hz")
-    if traj.interruptions:
-        print(f"[goto] {traj.interruptions} interruption(s); those pauses are "
-              "not in the recording")
     plot.draw(f"saved {out.name} — {n} samples", force=True)
-
-
-# ----------------------------------------------------------------------
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -203,7 +192,7 @@ def default_recording_path():
     them can never land on the same name.
     """
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return RECORDINGS / f"rr-{stamp}.csv"
+    return Path("recordings") / f"rr-{stamp}.csv"
 
 
 def main(argv=None):
@@ -228,8 +217,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:  # outside the guided session: the arm's own
-        print("\n[goto] interrupted.")  # context has stopped it on the way out
-        sys.exit(130)
+    sys.exit(main())
