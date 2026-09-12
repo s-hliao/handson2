@@ -1,13 +1,12 @@
-"""Send the arm to the planar pose, and optionally record a hand-guided RR path.
+"""Send the arm to the planar pose, then record hand-guided RR paths.
 
-    python goto.py --check                  # say what would happen, move nothing
-    python goto.py                          # the move, in meshcat
-    python goto.py --real                   # the move, on the real arm
-    python goto.py --real --guided          # record, return home, repeat until ctrl-c
+    python goto.py
 
-Simulation is the default; hardware needs `--real`.
+`xarm7_lib.Robot` picks the arm: the real one when ROBOT_IP is set, the MuJoCo
+simulation otherwise — and free drive needs the real one, there being nothing
+to push in simulation.
 
-The default target holds joints 2, 3, 5 and 6 at +90, +90, -90 and +90 degrees.
+The target holds joints 2, 3, 5 and 6 at +90, +90, -90 and +90 degrees.
 That is the "90 90 -90 90" locked set, and it leaves joints 1, 4 and 7 with
 their axes all parallel to world z. Joint 7's axis runs straight through the
 flange, so turning it only spins the tool: what is left is an exact planar RR
@@ -15,15 +14,11 @@ turning in a horizontal plane, joint 1 at the base and joint 4 at the elbow.
 At -70 and +60 degrees the wrist sits 478 mm in front of the base, near the
 robot's centre line.
 
-Leaving the free joints at zero instead — the bare "90 90 -90 90" — does not
+Leaving the free joints at zero instead — the bare "90 90 -90 90" — would not
 work: joint4 = 0 is the folded end of the elbow's travel, and the forearm ends
-up behind the shoulder, through link2. Run
+up behind the shoulder, through link2. The collision model refuses it.
 
-    python goto.py --check --joints 0,90,90,0,-90,90,0
-
-to see it refused.
-
-`--guided` (real arm only) adds, after the move:
+After the move:
 
     1. free drive, positioning. The controller's joint teaching mode lets the
        arm be pushed by hand; joints 2, 3, 5 and 6 are watched and put back if
@@ -49,8 +44,8 @@ end-effector xy the student's FK puts them at:
 their nominal +-90 (`home`), not at wherever they drifted to during the
 recording, so the replay lands on exactly the planar `xy` that was saved.
 
-The pose is passed and printed in degrees; everything below the CLI is
-radians, like the rest of the library.
+The pose is printed in degrees; everything else here is radians, like the rest
+of the library.
 """
 
 import argparse
@@ -81,7 +76,6 @@ _SETTLE_GRACE = 15.0  # s added to a move's travel time before the wait gives up
 # vertical enough to free-drive. 3 degrees tilts a 426 mm forearm by 22 mm.
 _PLANAR_TOLERANCE = math.radians(3.0)
 
-DEFAULT_DURATION = 300.0  # s, a cap on each free drive
 RECORDINGS = Path(__file__).resolve().parent / "recordings"
 
 # ----------------------------------------------------------------------
@@ -147,93 +141,11 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--real", action="store_true",
-        help="drive the real arm. Without this the run goes to the MuJoCo "
-        "simulation in meshcat.",
-    )
-    parser.add_argument(
-        "--sim", action="store_true",
-        help="drive the simulation (the default; say it explicitly if you like)",
-    )
-    parser.add_argument(
-        "--ip",
-        help="controller address. Defaults to the contents of ip.txt, in the "
-        "working directory or next to this script.",
-    )
-    parser.add_argument(
-        "--joints",
-        default=",".join(f"{v:g}" for v in DEFAULT_TARGET_DEG),
-        help="target as 7 comma-separated joint angles in degrees "
-        "(default: %(default)s)",
-    )
-    parser.add_argument(
-        "--speed", type=float, default=DEFAULT_SPEED,
-        help="joint speed for the move, rad/s (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--guided", action="store_true",
-        help="after arriving, free-drive the arm by hand and record RR "
-        "trajectories, returning home after each, until ctrl-c (real arm only)",
-    )
-    parser.add_argument(
-        "--duration", type=float, default=DEFAULT_DURATION,
-        help="cap on each free drive, s (default: %(default)s)",
-    )
-    parser.add_argument(
         "--out",
         help="folder to write the recordings to, each as rr-<timestamp>.npz "
         "(default: recordings/)",
     )
-    parser.add_argument(
-        "--check", action="store_true",
-        help="report whether the pose and the path to it are allowed, then stop",
-    )
-    parser.add_argument(
-        "--no-box", action="store_true",
-        help="switch off the workspace box; self-collision is still checked",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="command the pose even if the check refuses it. This disables the "
-        "library's guard only — the controller keeps its own self-collision "
-        "detection, and will abort the move if it agrees with the model.",
-    )
-    parser.add_argument(
-        "-y", "--yes", action="store_true", help="don't ask before moving",
-    )
-    args = parser.parse_args(argv)
-    if args.real and args.sim:
-        raise SystemExit("--real and --sim are opposites; pass one or neither.")
-    if args.guided and not args.real:
-        raise SystemExit(
-            "--guided needs --real: free drive is the controller's teaching "
-            "mode, and there is\nnothing to push in simulation. replay.py runs "
-            "in simulation against any saved recording."
-        )
-    if args.duration <= 0:
-        raise SystemExit("--duration must be positive")
-    return args
-
-
-def target_from(text):
-    """The 7-vector, in radians, that `--joints` names."""
-    values = [float(v) for v in text.replace(" ", "").split(",") if v]
-    if len(values) != 7:
-        raise SystemExit(f"--joints wants 7 angles in degrees, got {len(values)}")
-    return np.radians(values)
-
-
-def controller_ip(given, prefix="goto"):
-    """The address to connect to: what was asked for, or what ip.txt says."""
-    if given:
-        return given
-    for path in (Path.cwd() / "ip.txt", Path(__file__).resolve().parent / "ip.txt"):
-        if path.exists():
-            ip = path.read_text().strip()
-            if ip:
-                print(f"[{prefix}] using {ip} from {path}")
-                return ip
-    raise SystemExit("no controller address: pass --ip or put one in ip.txt.")
+    return parser.parse_args(argv)
 
 
 def default_recording_path(folder):
@@ -249,16 +161,12 @@ def degrees(q):
     return "[" + ", ".join(f"{math.degrees(v):7.2f}" for v in q) + "]"
 
 
-def preflight(start, goal, box):
-    """Report on the pose and on the straight line to it. True if both are clear.
-
-    Its own `SafetyGuard` rather than the arm's, so the verdict is the same
-    under `--force`, where the arm no longer has one.
-    """
-    from xarm7_lib.safety import DEFAULT_MARGIN, SafetyGuard
+def preflight(start, goal):
+    """Report on the pose and on the straight line to it. True if both are clear."""
+    from xarm7_lib.safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyGuard
 
     print("[goto] loading the collision model...")
-    guard = SafetyGuard(box=box, margin=DEFAULT_MARGIN)
+    guard = SafetyGuard(box=DEFAULT_BOX, margin=DEFAULT_MARGIN)
 
     pose = guard.check(goal)
     print(f"[goto] target pose: {'allowed' if pose is None else pose}")
@@ -275,23 +183,15 @@ def preflight(start, goal, box):
     return pose is None and path is None
 
 
-def connect(args, box):
-    """The arm this run drives, and the errors its controller raises.
+def connect():
+    """The arm this run drives: the real one if ROBOT_IP is set, else the sim.
 
     Imported here rather than at the top so that importing this module costs
-    nothing but the standard library and numpy. The simulator has no
-    controller, so its error tuple is empty, and an empty tuple never matches.
+    nothing but the standard library and numpy.
     """
-    guard = not args.force
-    if args.real:
-        from xarm7_lib import RealXArm7, XArmError
+    from xarm7_lib import Robot
 
-        arm = RealXArm7(controller_ip(args.ip), safety_box=box, guard=guard)
-        return arm, (XArmError,)
-
-    from xarm7_lib import SimulatedXArm7
-
-    return SimulatedXArm7(visualize=True, safety_box=box, guard=guard), ()
+    return Robot()
 
 
 def confirm(question):
@@ -376,9 +276,10 @@ def travel_timeout(start, goal, speed):
     return span / max(speed, 1e-6) + _SETTLE_GRACE
 
 
-def move_to(arm, goal, speed, controller_errors):
+def move_to(arm, goal, speed):
     """Drive to `goal`. Returns (reached, exit code) — the code is None if the
     move was allowed to happen at all, whatever came of it."""
+    from xarm7_lib import XArmError
     from xarm7_lib.safety import SafetyError
 
     try:
@@ -389,7 +290,7 @@ def move_to(arm, goal, speed, controller_errors):
     except SafetyError as err:
         print(f"[goto] refused by the guard: {err}")
         return False, 2
-    except controller_errors as err:
+    except XArmError as err:
         print(f"[goto] the controller refused it: {err}")
         return False, 3
     except KeyboardInterrupt:
@@ -464,7 +365,7 @@ def rr_recording(traj, t_start, home):
     )
 
 
-def guided_session(arm, home, folder, duration, plot, ctrl_c):
+def guided_session(arm, home, folder, plot, ctrl_c):
     """One free drive: position, record, save."""
     from xarm7_lib.free_drive import FREE_JOINTS
 
@@ -493,13 +394,14 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
         return wait_for_enter("        press enter when your hands are clear: ",
                               ctrl_c, plot)
 
-    traj = arm.free_drive(FREE_JOINTS, duration, on_sample=on_sample,
+    # math.inf: the run ends when `on_sample` says so, not on a clock.
+    traj = arm.free_drive(FREE_JOINTS, math.inf, on_sample=on_sample,
                           confirm=hands_off)
     print(f"[goto] {traj}")
-    if arm.has_error:
+    if arm.robot.has_error:  # `Robot` doesn't forward these; the real arm has them
         print("[goto] the controller latched an error during free drive; "
               "clearing it.")
-        arm.clear_errors()
+        arm.robot.clear_errors()
 
     if state["t_start"] is None or not np.any(traj.t >= state["t_start"]):
         print("[goto] recording never started; nothing saved.")
@@ -519,27 +421,27 @@ def guided_session(arm, home, folder, duration, plot, ctrl_c):
     plot.draw(f"saved {out.name} — {t.size} samples", force=True)
 
 
-def return_home(arm, home, speed, box, controller_errors, ask, ctrl_c, plot):
+def return_home(arm, home, speed, ctrl_c, plot):
     """Drive back to `home`. None once there, or the exit code if not."""
     print(f"[goto] returning to {degrees(home)} deg")
-    if not preflight(arm.joint_values, home, box):
+    if not preflight(arm.joint_values, home):
         print("[goto] the way back isn't clear from where the arm was "
               "left.\n       Leaving it as it is — move it clear and "
               "re-run.")
         return 2
-    if ask and not wait_for_enter(
+    if not wait_for_enter(
         f"[goto] hands clear — press enter to drive back at {speed} rad/s. ",
         ctrl_c, plot,
     ):
         return 0 if ctrl_c.requested else 1
     with ctrl_c.moving():
-        reached, code = move_to(arm, home, speed, controller_errors)
+        reached, code = move_to(arm, home, speed)
     if code is not None:
         return code
     return None if reached else 1
 
 
-def guided_loop(arm, home, args, box, controller_errors):
+def guided_loop(arm, home, args):
     """Record, return home, and go again, until ctrl-c. Returns the exit code."""
     offenders = out_of_plane(arm.joint_values)
     if offenders:
@@ -557,7 +459,6 @@ def guided_loop(arm, home, args, box, controller_errors):
           "they drift.\n       After each recording the arm drives home and "
           "free drive starts again.\n       Ctrl-c to finish.")
     folder = Path(args.out) if args.out else RECORDINGS
-    speed = min(args.speed, RETURN_SPEED_CAP)
     plot = None
     with CtrlC() as ctrl_c:
         try:
@@ -568,14 +469,13 @@ def guided_loop(arm, home, args, box, controller_errors):
                 if plot is None or plot.closed:
                     plot = LivePlot()
                 if not ctrl_c.requested:
-                    guided_session(arm, home, folder, args.duration, plot, ctrl_c)
+                    guided_session(arm, home, folder, plot, ctrl_c)
                 if ctrl_c.requested:
                     # Free drive has already handed the arm back to position
                     # control, so it is standing still wherever it was left.
                     print("[goto] done. The arm is stopped and holding where it is.")
                     return 0
-                code = return_home(arm, home, speed, box, controller_errors,
-                                   not args.yes, ctrl_c, plot)
+                code = return_home(arm, home, RETURN_SPEED_CAP, ctrl_c, plot)
                 if code is not None:
                     return code
         except KeyboardInterrupt:  # a second ctrl-c, or one during a move
@@ -589,60 +489,34 @@ def guided_loop(arm, home, args, box, controller_errors):
 
 def main(argv=None):
     args = parse_args(argv)
-    from xarm7_lib.safety import DEFAULT_BOX
-
-    goal = target_from(args.joints)
-    box = None if args.no_box else DEFAULT_BOX
+    goal = np.radians(DEFAULT_TARGET_DEG)
     np.set_printoptions(precision=3, suppress=True)
-    if args.guided:
-        check_fk(goal)
+    check_fk(goal)
 
-    arm, controller_errors = connect(args, box)
-    with arm:
+    arm = connect()
+    # `Robot` isn't a context manager itself; the backend it wraps is, and its
+    # exit is what puts the arm back in position control and disconnects.
+    with arm.robot:
         start = arm.joint_values
         print(f"[goto] now at  {degrees(start)} deg")
-        print(f"[goto] going to {degrees(goal)} deg at {args.speed} rad/s")
+        print(f"[goto] going to {degrees(goal)} deg at {DEFAULT_SPEED} rad/s")
 
-        clear = preflight(start, goal, box)
-        if args.check:
-            return 0 if clear else 2
-        if not clear and not args.force:
-            print(
-                "[goto] refusing to command a pose the collision model rejects.\n"
-                "       Pass --force if you are sure the model is wrong about\n"
-                "       your arm; the controller keeps its own detection either way."
-            )
+        if not preflight(start, goal):
+            print("[goto] refusing to command a pose the collision model rejects.")
             return 2
-        if not clear:
-            print("[goto] --force given: the library's guard is off for this move.")
-            if not args.yes and not confirm(
-                "This may drive the arm into itself. Continue?"
-            ):
-                return 1
 
-        if not args.yes and not confirm("Clear the workspace. Move now?"):
+        if not confirm("Clear the workspace. Move now?"):
             return 1
 
-        reached, code = move_to(arm, goal, args.speed, controller_errors)
+        reached, code = move_to(arm, goal, DEFAULT_SPEED)
         if code is not None:
             return code
-
-        if not args.guided:
-            if not args.real:
-                # The viewer dies with the process, so hold it open to be
-                # looked at.
-                try:
-                    input("[goto] meshcat is live; press enter to close. ")
-                except EOFError:
-                    pass
-            return 0 if reached else 1
-
         if not reached:
             print("[goto] not starting free drive: the arm never reached the pose.")
             return 1
 
         # ---- free drive: record, return home, repeat until ctrl-c -------
-        return guided_loop(arm, goal, args, box, controller_errors)
+        return guided_loop(arm, goal, args)
 
 
 if __name__ == "__main__":
