@@ -108,7 +108,7 @@ def connect():
         raise SystemExit("[goto] Robot() gave the simulation, not the real arm.")
     return arm
 
-def prepare_start(arm):
+def reset(arm):
     """Move the arm to the locked pose, leaving the free joints wherever they are.
 
     The locked joints are 2, 3, 5 and 6 at +90, +90, -90 and +90 degrees.
@@ -120,7 +120,7 @@ def prepare_start(arm):
         raise RuntimeError("Arm never reached the locked pose.")
 
 
-def rr_recording(traj):
+def save_recording(traj):
     """A free-drive `Trajectory` as the file's (N, 2) angles, one row per tick."""
     theta = np.column_stack(q2rr(traj.q.T))
     changed = np.any(np.diff(theta, axis=0) != 0, axis=1)
@@ -131,7 +131,7 @@ def rr_recording(traj):
     )
 
 
-def guided_session(arm: Robot, out, plot, ctrl_c):
+def main(arm: Robot, out, plot, ctrl_c):
     """One free drive: record until ctrl-c, then save."""
     plot.reset("recording — ctrl-c to stop")
     print("[goto] free drive: push the arm through the path to record.\n"
@@ -165,7 +165,7 @@ def guided_session(arm: Robot, out, plot, ctrl_c):
                           on_sample=on_sample,
                           confirm=pause_until_safe)
 
-    theta = rr_recording(traj)
+    theta = save_recording(traj)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(out, theta, delimiter=",", fmt="%.10f",
                header=f"theta1,theta2 in radians, {RECORD_RATE:.0f} Hz")
@@ -173,17 +173,14 @@ def guided_session(arm: Robot, out, plot, ctrl_c):
     print(f"[goto] {n} samples over {n / RECORD_RATE:.1f}s written to {out}")
     plot.draw(f"saved {out.name} — {n} samples", force=True)
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description=__doc__.splitlines()[0],
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def parse_args():
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--out",
         help="file to write the recording to "
         "(default: recordings/rr-<timestamp>.csv)",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args()
 
 def default_recording_path():
     """recordings/rr-<timestamp>.csv, stamped when free drive starts.
@@ -194,27 +191,13 @@ def default_recording_path():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path("recordings") / f"rr-{stamp}.csv"
 
-
-def main(argv=None):
-    args = parse_args(argv)
+if __name__ == "__main__":
+    args = parse_args()
     np.set_printoptions(precision=3, suppress=True)
 
     robot = connect()
-    # `Robot` isn't a context manager itself; the backend it wraps is, and its
-    # exit is what puts the arm back in position control and disconnects.
     with robot.robot:
-        prepare_start(robot)
-
-        # ---- free drive: one recording --------------------------------
-        print("[goto] free drive: joints 1, 4 and 7 can be pushed by hand; 2, 3, "
-              "5 and 6 are\n       watched, and the arm stops to put them back "
-              "if they drift.\n       Everything is recorded; ctrl-c to stop and "
-              "save.")
+        reset(robot)
         out = Path(args.out) if args.out else default_recording_path()
         with CtrlC() as ctrl_c:
-            guided_session(robot, out, LivePlot(), ctrl_c)
-        return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+            main(robot, out, LivePlot(), ctrl_c)
