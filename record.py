@@ -99,18 +99,6 @@ class CtrlC:
         signal.signal(signal.SIGINT, self._previous)
 
 
-def connect():
-    """Connect to the real arm. Refuses the simulation, which has nothing to push."""
-    if not os.environ.get("ROBOT_IP", "").strip():
-        raise SystemExit(
-            "[record] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
-            "       Set it to the controller's address and run again."
-        )
-    arm = Robot()
-    if not isinstance(arm.robot, RealXArm7):
-        raise SystemExit("[record] Robot() gave the simulation, not the real arm.")
-    return arm
-
 def reset(arm):
     """Move the arm to the locked pose, leaving the free joints wherever they are.
 
@@ -167,6 +155,7 @@ def main(arm: Robot, out, plot, ctrl_c):
 
     # math.inf: the run ends when `on_sample` says so, not on a clock.
     traj = arm.free_drive(FREE_JOINTS, duration=math.inf,
+                          tolerance=0.1,
                           on_sample=on_sample,
                           confirm=pause_until_safe)
 
@@ -200,8 +189,16 @@ if __name__ == "__main__":
     args = parse_args()
     np.set_printoptions(precision=3, suppress=True)
 
-    robot = connect()
-    with robot.robot:
+    if not os.environ.get("ROBOT_IP", "").strip():
+        raise SystemExit(
+            "[record] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
+            "       Set it to the controller's address and run again."
+        )
+
+    with Robot() as robot:
+        if not isinstance(robot.robot, RealXArm7):
+            raise SystemExit("[record] Robot() gave the simulation, not the real arm.")
+
         reset(robot)
         out = Path(args.out) if args.out else default_recording_path()
         with CtrlC() as ctrl_c:
