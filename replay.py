@@ -86,10 +86,7 @@ class RRArm:
         if n == 0:
             print(f"{self.name}: nothing was replayed")
             return
-        error = np.linalg.norm(np.asarray(self.measured[:n]) - self.xy[:n], axis=1)
-        print(f"{self.name}: {len(self.measured)} of {len(self.xy)} samples replayed, "
-              f"xy tracking error max {error.max() * 1000:.1f} mm, "
-              f"rms {np.sqrt(np.mean(error ** 2)) * 1000:.1f} mm")
+        print(f"{self.name}: {len(self.measured)} of {len(self.xy)} samples replayed.")
         self._redraw(f"{self.name} — done")
 
     def _redraw(self, title=None):

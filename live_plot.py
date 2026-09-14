@@ -28,7 +28,7 @@ _REDRAW_PERIOD = 0.05  # s between redraws; record.py's free-drive loop runs at 
 # m of arrow per m/s of end-effector speed. Hand guiding runs at a few tenths
 # of a m/s, so this draws those as an arrow a few cm long in a workspace that is
 # most of a metre across — visible, without covering the arm it comes off.
-_VELOCITY_SCALE = 0.3
+_VELOCITY_SCALE = 1.0
 
 
 def arm_points(q):
