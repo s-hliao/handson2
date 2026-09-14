@@ -25,7 +25,9 @@ After the move:
        pushed by hand; joints 2, 3, 5 and 6 are watched and put back if they
        drift (see `xarm7_lib/free_drive.py`). A live plot, drawn with the
        student's `forward_kinematics_RR` from `fk.py`, shows the RR arm and
-       the path it has been through. Everything from here on is recorded.
+       the path it has been through, with the end effector's velocity — the
+       measured joint speeds through the student's `jacobian_RR` — as an
+       arrow off the tip. Everything from here on is recorded.
     2. ctrl-c ends it: the arm stops where it stands, and the path is saved
        to recordings/.
 
@@ -67,7 +69,7 @@ from xarm7_lib import RealXArm7, Robot
 from xarm7_lib.free_drive import FREE_JOINTS
 
 from live_plot import LivePlot
-from robot_info import LOCKED_ANGLES_DEG, LOCKED_INDICES, RECORD_RATE, q2rr
+from robot_info import LOCKED_ANGLES_DEG, LOCKED_INDICES, RECORD_RATE, q2rr, qd2rr
 
 
 class CtrlC:
@@ -139,7 +141,9 @@ def main(arm: Robot, out, plot, ctrl_c):
           "       Ctrl-c stops it there and saves what it has been through.")
 
     def on_sample(t, q):
-        plot.update(q2rr(q))
+        # The measured joint speeds, read next to the angles the loop just took,
+        # so the arrow is the arm's velocity as it is being pushed.
+        plot.update(q2rr(q), qd2rr(arm.joint_velocities))
         return ctrl_c.requested  # True ends the run, and the arm holds where it is
 
     def pause_until_safe(message):

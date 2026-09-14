@@ -5,7 +5,9 @@
 
 The real arm when ROBOT_IP is set, the MuJoCo simulation otherwise. The
 trajectory is drawn with the student's FK: the planned (recorded) path dotted,
-and the path the arm actually takes as it replays solid.
+and the path the arm actually takes as it replays solid. The arrow off the end
+effector is its velocity, the measured joint speeds through the student's
+`jacobian_RR`.
 """
 
 import argparse
@@ -18,7 +20,7 @@ from xarm7_lib import Robot
 
 from fk import run_trajectory
 from live_plot import LivePlot, arm_points
-from robot_info import RECORD_RATE, q2rr, rr2q
+from robot_info import RECORD_RATE, q2rr, qd2rr, rr2q
 
 RECORDINGS = Path(__file__).parent / "recordings"
 START_SPEED = 0.3  # rad/s, for set_position's planned move
@@ -69,7 +71,8 @@ class RRArm:
         self.robot.servo_joints(q)
         self.last = q
         # the angles the arm really reached, drawn at the plot's own rate
-        self.plot.update(q2rr(self.robot.joint_values))
+        self.plot.update(q2rr(self.robot.joint_values),
+                         qd2rr(self.robot.joint_velocities))
         self.next_tick += 1.0 / RECORD_RATE
         time.sleep(max(0.0, self.next_tick - time.perf_counter()))
 
@@ -91,8 +94,9 @@ class RRArm:
 
     def _redraw(self, title=None):
         """Show where the arm is now, whatever the plot's own redraw rate."""
-        self.plot.update(q2rr(self.robot.joint_values), record=False,
-                         title=title, force=True)
+        self.plot.update(q2rr(self.robot.joint_values),
+                         qd2rr(self.robot.joint_velocities),
+                         record=False, title=title, force=True)
 
 
 def recording_path(name):

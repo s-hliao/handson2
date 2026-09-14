@@ -40,6 +40,38 @@ def forward_kinematics_RR(theta1, theta2):
     }
 
 
+def jacobian_RR(theta1, theta2):
+    """
+    Returns the end-effector Jacobian of an RR robot given the joint angle positions
+    in radians.
+
+    The Jacobian is the matrix that turns joint velocities into end-effector
+    velocity. With the end effector at p(theta1, theta2) = (x, y),
+
+        [x_dot]        [theta1_dot]                   [dx/dtheta1  dx/dtheta2]
+        [y_dot]  = J @ [theta2_dot]  ,   where   J =  [dy/dtheta1  dy/dtheta2]
+
+    so column j of J is the direction the end effector moves when joint j alone
+    turns at 1 rad/s. Same convention and same link lengths as
+    `forward_kinematics_RR`.
+
+    Returns J, a (2, 2) matrix, in the base frame.
+    """
+    l1, l2 = robot_info()['link_lengths']
+
+    # To-Do 2: Differentiate the end-effector position `forward_kinematics_RR`
+    # puts in the last column of H_4_0,
+    #     x = l1*cos(theta1) + l2*cos(theta1 + theta2)
+    #     y = l1*sin(theta1) + l2*sin(theta1 + theta2),
+    # once with respect to each joint angle, and lay the four partials out as
+    # the two columns of J.
+    c1, s1 = np.cos(theta1), np.sin(theta1)
+    c12, s12 = np.cos(theta1 + theta2), np.sin(theta1 + theta2)
+
+    return np.array([[-l1 * s1 - l2 * s12, -l2 * s12],   # dx/dtheta1, dx/dtheta2
+                     [l1 * c1 + l2 * c12,   l2 * c12]])  # dy/dtheta1, dy/dtheta2
+
+
 def load_trajectory(path):
     """
     Loads a trajectory recorded by `record.py` and returns its RR joint angles.
@@ -71,7 +103,7 @@ def run_trajectory(arm, path):
     """
     theta1, theta2 = load_trajectory(path)
 
-    # To-Do 2: Command the arm to follow loaded trajectory.
+    # To-Do 3: Command the arm to follow loaded trajectory.
     arm.set_position(theta1[0], theta2[0])
     for k in range(len(theta1)):
         arm.servo_to_position(theta1[k], theta2[k])

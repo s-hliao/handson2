@@ -44,6 +44,15 @@ def q2rr(q):
     return q[0] + A1, A2 - q[3]
 
 
+def qd2rr(qd):
+    """(theta1_dot, theta2_dot) of the planar RR, from 7 joint velocities.
+
+    The time derivative of `q2rr`: A1 and A2 are constants, so all that is left
+    of it is which joint each angle comes from, and that joint 4 runs backwards.
+    """
+    return qd[0], -qd[3]
+
+
 def rr2q(theta1, theta2):
     """The 7-joint configuration at the planar RR's (theta1, theta2).
 
