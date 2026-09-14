@@ -42,7 +42,7 @@ def forward_kinematics_RR(theta1, theta2):
 
 def load_trajectory(path):
     """
-    Loads a trajectory recorded by `goto.py --guided` and returns its RR joint angles.
+    Loads a trajectory recorded by `record.py` and returns its RR joint angles.
 
     The recording is a comma-separated text file, one row per sample, taken at
     100 Hz — so sample k was taken at k / 100 seconds. Each row is two joint angles

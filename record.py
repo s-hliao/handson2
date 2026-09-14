@@ -1,6 +1,7 @@
 """Send the arm to the planar pose, then record hand-guided RR paths.
 
-    python goto.py
+    python record.py                    # into recordings/rr-<timestamp>.csv
+    python record.py my-circle.csv      # or wherever you say
 
 Set ROBOT_IP first: free drive is the controller's own teaching mode, so this
 script wants the real arm, and refuses the simulation `xarm7_lib.Robot` would
@@ -86,7 +87,7 @@ class CtrlC:
         if self.requested:
             raise KeyboardInterrupt
         self.requested = True
-        print("\n[goto] ctrl-c: finishing (again to force)")
+        print("\n[record] ctrl-c: finishing (again to force)")
 
     def __enter__(self):
         self._previous = signal.signal(signal.SIGINT, self._handler)
@@ -100,12 +101,12 @@ def connect():
     """Connect to the real arm. Refuses the simulation, which has nothing to push."""
     if not os.environ.get("ROBOT_IP", "").strip():
         raise SystemExit(
-            "[goto] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
+            "[record] ROBOT_IP is not set, so there is no arm to hand-guide.\n"
             "       Set it to the controller's address and run again."
         )
     arm = Robot()
     if not isinstance(arm.robot, RealXArm7):
-        raise SystemExit("[goto] Robot() gave the simulation, not the real arm.")
+        raise SystemExit("[record] Robot() gave the simulation, not the real arm.")
     return arm
 
 def reset(arm):
@@ -134,7 +135,7 @@ def save_recording(traj):
 def main(arm: Robot, out, plot, ctrl_c):
     """One free drive: record until ctrl-c, then save."""
     plot.reset("recording — ctrl-c to stop")
-    print("[goto] free drive: push the arm through the path to record.\n"
+    print("[record] free drive: push the arm through the path to record.\n"
           "       Ctrl-c stops it there and saves what it has been through.")
 
     def on_sample(t, q):
@@ -170,13 +171,13 @@ def main(arm: Robot, out, plot, ctrl_c):
     np.savetxt(out, theta, delimiter=",", fmt="%.10f",
                header=f"theta1,theta2 in radians, {RECORD_RATE:.0f} Hz")
     n = len(theta)
-    print(f"[goto] {n} samples over {n / RECORD_RATE:.1f}s written to {out}")
+    print(f"[record] {n} samples over {n / RECORD_RATE:.1f}s written to {out}")
     plot.draw(f"saved {out.name} — {n} samples", force=True)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--out",
+        "out", nargs="?",
         help="file to write the recording to "
         "(default: recordings/rr-<timestamp>.csv)",
     )

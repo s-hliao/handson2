@@ -97,7 +97,7 @@ class RRArm:
 
 def recording_path(name):
     """The file to play. A name with no folder is looked for in recordings/,
-    so the file name goto.py prints when it saves can be pasted straight in."""
+    so the file name record.py prints when it saves can be pasted straight in."""
     path = Path(name)
     if not path.exists():
         path = RECORDINGS / name

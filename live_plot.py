@@ -2,7 +2,7 @@
 
 One view, used twice:
 
-    LivePlot()              `goto.py --guided`: the arm as it is hand-guided,
+    LivePlot()              `record.py`: the arm as it is hand-guided,
                             and the path recorded.
     LivePlot(planned=True)  `replay.py`: the same, plus the recorded path it
                             is meant to follow.
@@ -19,7 +19,7 @@ from xarm7_lib.safety import DEFAULT_BOX
 
 from fk import forward_kinematics_RR
 
-_REDRAW_PERIOD = 0.05  # s between redraws; goto's free-drive loop samples at 100 Hz
+_REDRAW_PERIOD = 0.05  # s between redraws; record.py's free-drive loop runs at 100 Hz
 
 
 def arm_points(q):
@@ -46,7 +46,7 @@ class LivePlot:
     and a redraw is a blit of that background plus those few lines: a few
     milliseconds instead of tens. `update` never redraws more often than
     `_REDRAW_PERIOD` either, so it can be called on every sample — which
-    `goto.py` does, from inside the free-drive watch loop.
+    `record.py` does, from inside the free-drive watch loop.
     """
 
     def __init__(self, planned=False):

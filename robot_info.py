@@ -20,7 +20,7 @@ RR_INDICES = np.array([0, 3])
 # wrist sits 478 mm in front of the base, near the robot's centre line.
 HOME_DEG = np.array([-70.0, 90.0, 90.0, 60.0, -90.0, 90.0, 0.0])
 
-# Hz. Free drive samples the arm this often, so goto.py writes its recordings
+# Hz. Free drive samples the arm this often, so record.py writes its recordings
 # on this grid — row k is the arm at k / RECORD_RATE — and replay.py streams
 # them back at it. Nothing in a recording says what it was, so both ends read
 # it from here.
